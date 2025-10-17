@@ -107,12 +107,3 @@ steps: 63
 * Coyote’s jump only triggers if movement is blocked.
 * RoadRunner’s burst step is small but frequent, making him visually faster.
 
----
-
-## 🏁 Credits
-
-Developed by **Aubin Darcy Irakoze**, Saint Cloud State University.
-
-Original concept: *Multithreaded Grid Race (Spring Semester)* — enhanced with character abilities and stable console rendering for GitHub release.
-
-GitHub repo: [Darcythiam/toons-flag-chase](https://github.com/Darcythiam/toons-flag-chase)
