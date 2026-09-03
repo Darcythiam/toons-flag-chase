@@ -1,5 +1,7 @@
 # toons-flag-chase — README
 
+[![CI](https://github.com/Darcythiam/toons-flag-chase/actions/workflows/ci.yml/badge.svg)](https://github.com/Darcythiam/toons-flag-chase/actions/workflows/ci.yml)
+
 Multithreaded cartoon race simulation with three Disney-inspired characters, each having unique abilities, rendered as **stacked ASCII boards** in the console.
 
 ---

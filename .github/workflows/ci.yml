@@ -1,0 +1,163 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  # Stress-test configurations from docs/SANITIZERS.md — kept in one place
+  # so the two sanitizer jobs below run byte-for-byte the same commands.
+  STRESS_A: >-
+    --toons 4000 --rows 140 --cols 280 --max-steps 100000
+    --shoot-chance 0.5 --jump-chance 0.5 --delay-ms 0 --no-render
+  STRESS_B: >-
+    --toons 50 --rows 30 --cols 6000 --max-steps 100000
+    --shoot-chance 0.5 --jump-chance 0.5 --shoot-cooldown 50 --freeze-ms 50
+    --delay-ms 0 --no-render
+
+jobs:
+  build-release:
+    name: Build (Release)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache build directory
+        uses: actions/cache@v4
+        with:
+          path: build
+          key: build-release-${{ runner.os }}-${{ hashFiles('src/main.cpp', 'CMakeLists.txt') }}
+          restore-keys: |
+            build-release-${{ runner.os }}-
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+  tsan:
+    name: ThreadSanitizer stress test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache build directory
+        uses: actions/cache@v4
+        with:
+          path: build-tsan
+          key: build-tsan-${{ runner.os }}-${{ hashFiles('src/main.cpp', 'CMakeLists.txt') }}
+          restore-keys: |
+            build-tsan-${{ runner.os }}-
+
+      - name: Configure
+        run: cmake -S . -B build-tsan -DSANITIZER=thread -DCMAKE_BUILD_TYPE=Debug
+
+      - name: Build
+        run: cmake --build build-tsan -j"$(nproc)"
+
+      - name: Stress test A (high-concurrency / thread-churn), 5 seeds
+        shell: bash
+        run: |
+          set -uo pipefail
+          fail=0
+          : > tsan_a.log
+          for seed in 1 2 3 4 5; do
+            echo "=== seed $seed ===" | tee -a tsan_a.log
+            ./build-tsan/toons $STRESS_A --seed "$seed" 2>&1 | tee -a tsan_a.log
+            rc=${PIPESTATUS[0]}
+            [ "$rc" -ne 0 ] && fail=1
+          done
+          grep -q "WARNING: ThreadSanitizer" tsan_a.log && fail=1
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::ThreadSanitizer reported an issue in stress test A"
+            exit 1
+          fi
+
+      - name: Stress test B (sustained duration), 5 seeds
+        shell: bash
+        run: |
+          set -uo pipefail
+          fail=0
+          : > tsan_b.log
+          for seed in 1 2 3 4 5; do
+            echo "=== seed $seed ===" | tee -a tsan_b.log
+            ./build-tsan/toons $STRESS_B --seed "$seed" 2>&1 | tee -a tsan_b.log
+            rc=${PIPESTATUS[0]}
+            [ "$rc" -ne 0 ] && fail=1
+          done
+          grep -q "WARNING: ThreadSanitizer" tsan_b.log && fail=1
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::ThreadSanitizer reported an issue in stress test B"
+            exit 1
+          fi
+
+      - name: Upload TSan logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tsan-logs
+          path: tsan_*.log
+
+  asan:
+    name: ASan+UBSan stress test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache build directory
+        uses: actions/cache@v4
+        with:
+          path: build-asan
+          key: build-asan-${{ runner.os }}-${{ hashFiles('src/main.cpp', 'CMakeLists.txt') }}
+          restore-keys: |
+            build-asan-${{ runner.os }}-
+
+      - name: Configure
+        run: cmake -S . -B build-asan -DSANITIZER=address -DCMAKE_BUILD_TYPE=Debug
+
+      - name: Build
+        run: cmake --build build-asan -j"$(nproc)"
+
+      - name: Stress test A (high-concurrency / thread-churn), 5 seeds
+        shell: bash
+        run: |
+          set -uo pipefail
+          fail=0
+          : > asan_a.log
+          for seed in 1 2 3 4 5; do
+            echo "=== seed $seed ===" | tee -a asan_a.log
+            ./build-asan/toons $STRESS_A --seed "$seed" 2>&1 | tee -a asan_a.log
+            rc=${PIPESTATUS[0]}
+            [ "$rc" -ne 0 ] && fail=1
+          done
+          grep -Eq "ERROR: AddressSanitizer|runtime error" asan_a.log && fail=1
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::AddressSanitizer/UBSan reported an issue in stress test A"
+            exit 1
+          fi
+
+      - name: Stress test B (sustained duration), 5 seeds
+        shell: bash
+        run: |
+          set -uo pipefail
+          fail=0
+          : > asan_b.log
+          for seed in 1 2 3 4 5; do
+            echo "=== seed $seed ===" | tee -a asan_b.log
+            ./build-asan/toons $STRESS_B --seed "$seed" 2>&1 | tee -a asan_b.log
+            rc=${PIPESTATUS[0]}
+            [ "$rc" -ne 0 ] && fail=1
+          done
+          grep -Eq "ERROR: AddressSanitizer|runtime error" asan_b.log && fail=1
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::AddressSanitizer/UBSan reported an issue in stress test B"
+            exit 1
+          fi
+
+      - name: Upload ASan/UBSan logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: asan-logs
+          path: asan_*.log
