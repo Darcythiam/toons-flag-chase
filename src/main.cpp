@@ -2,6 +2,7 @@
 #include <atomic>
 #include <cassert>
 #include <chrono>
+#include <cmath>
 #include <csignal>
 #include <functional>
 #include <iomanip>
@@ -36,6 +37,13 @@ struct Options {
     double sam_shoot_chance = 0.15;    // YosemiteSam may shoot
     int    sam_cooldown_ms = 1500;     // cooldown between shots
     int    sam_freeze_ms   = 1000;     // freeze duration
+
+    // Benchmark / sweep (see docs/SANITIZERS.md sibling: docs/BENCHMARKS.md)
+    bool benchmark = false;            // --benchmark: N trials at --toons, report throughput+latency
+    int  benchmark_trials = 10;        // --benchmark-trials N
+    bool sweep = false;                // --sweep: run --benchmark across a list of agent counts
+    string sweep_counts = "10,100,1000,10000,100000"; // --sweep-counts "a,b,c"
+    string csv_out = "bench_global_mutex_baseline.csv"; // --csv-out PATH
 };
 
 static atomic<bool> gStop(false);
@@ -49,17 +57,47 @@ void on_sigint(int){ gStop.store(true); }
 // silently opening a lock-order deadlock.
 static thread_local bool holding_render_mtx = false;
 
+#ifdef LOCK_INSTRUMENTATION
+// Per-thread accumulation of time spent waiting to acquire board.mtx and
+// time spent holding it, in nanoseconds. Only compiled in when the
+// LOCK_INSTRUMENTATION CMake option is ON (a separate build from the one
+// used for the real throughput/latency numbers -- see docs/BENCHMARKS.md
+// for why: timing every lock acquisition/release adds overhead that would
+// skew the very throughput figures the benchmark exists to measure).
+// Each worker thread is 1:1 with one agent for its whole lifetime (no
+// thread pooling), so these reset to zero naturally on every new trial.
+static thread_local long long tlBoardWaitNs = 0;
+static thread_local long long tlBoardHoldNs = 0;
+#endif
+
 struct BoardLock {
     explicit BoardLock(mutex &m) : m_(m) {
         assert(!holding_render_mtx &&
                "lock-order violation: board.mtx acquired while render_mtx held");
+#ifdef LOCK_INSTRUMENTATION
+        auto t0 = steady_clock::now();
         m_.lock();
+        auto t1 = steady_clock::now();
+        tlBoardWaitNs += duration_cast<nanoseconds>(t1 - t0).count();
+        holdStart_ = t1;
+#else
+        m_.lock();
+#endif
     }
-    ~BoardLock(){ m_.unlock(); }
+    ~BoardLock(){
+#ifdef LOCK_INSTRUMENTATION
+        auto t1 = steady_clock::now();
+        tlBoardHoldNs += duration_cast<nanoseconds>(t1 - holdStart_).count();
+#endif
+        m_.unlock();
+    }
     BoardLock(const BoardLock&) = delete;
     BoardLock& operator=(const BoardLock&) = delete;
 private:
     mutex &m_;
+#ifdef LOCK_INSTRUMENTATION
+    steady_clock::time_point holdStart_;
+#endif
 };
 
 struct RenderLock {
@@ -153,19 +191,31 @@ Options parseArgs(int argc, char** argv){
         else if(a=="--freeze-ms") next(o.sam_freeze_ms);
         else if(a=="--jump-chance") { if(i+1<argc) o.coy_jump_chance = stod(argv[++i]); }
         else if(a=="--no-render") o.render = false;
+        else if(a=="--benchmark") o.benchmark = true;
+        else if(a=="--benchmark-trials") next(o.benchmark_trials);
+        else if(a=="--sweep") o.sweep = true;
+        else if(a=="--sweep-counts") { if(i+1<argc) o.sweep_counts = argv[++i]; }
+        else if(a=="--csv-out") { if(i+1<argc) o.csv_out = argv[++i]; }
         else if(a=="--help"){
             cout << "Options\n"
                  << "  --rows N             (default 18)\n"
                  << "  --cols N             (default 36)\n"
                  << "  --toons N            (default 3; any positive N, roles R/C/Y cycle)\n"
-                 << "  --max-steps N        (default 10000; hard cap on total steps taken)\n"
+                 << "  --max-steps N        (default 10000; hard cap on total steps taken;\n"
+                 << "                        also the per-trial tick budget in --benchmark/--sweep)\n"
                  << "  --seed N             (default time)\n"
                  << "  --delay-ms N         (default 120)\n"
                  << "  --shoot-chance X     (default 0.15)\n"
                  << "  --shoot-cooldown N   (ms, default 1500)\n"
                  << "  --freeze-ms N        (default 1000)\n"
                  << "  --jump-chance X      (default 0.25)\n"
-                 << "  --no-render          (skip per-frame board/event printing; for stress runs)\n";
+                 << "  --no-render          (skip per-frame board/event printing; for stress runs)\n"
+                 << "  --benchmark          (run --benchmark-trials trials at --toons, headless,\n"
+                 << "                        forces delay-ms=0; reports throughput + frame latency)\n"
+                 << "  --benchmark-trials N (default 10)\n"
+                 << "  --sweep              (run --benchmark across --sweep-counts, write --csv-out)\n"
+                 << "  --sweep-counts LIST  (comma-separated agent counts, default \"10,100,1000,10000,100000\")\n"
+                 << "  --csv-out PATH       (default bench_global_mutex_baseline.csv)\n";
             exit(0);
         }
     }
@@ -173,6 +223,7 @@ Options parseArgs(int argc, char** argv){
     o.rows = max(5, o.rows);
     o.cols = max(20, o.cols);
     o.maxSteps = max(100, o.maxSteps);
+    o.benchmark_trials = max(1, o.benchmark_trials);
     return o;
 }
 
@@ -185,7 +236,16 @@ static void printConfig(const Options &o){
          << " jump-chance=" << o.coy_jump_chance
          << " shoot-chance=" << o.sam_shoot_chance
          << " shoot-cooldown-ms=" << o.sam_cooldown_ms
-         << " freeze-ms=" << o.sam_freeze_ms << "\n\n";
+         << " freeze-ms=" << o.sam_freeze_ms << "\n";
+    if(o.benchmark || o.sweep){
+        cout << "benchmark=" << (o.benchmark?"on":"off") << " sweep=" << (o.sweep?"on":"off")
+             << " benchmark-trials=" << o.benchmark_trials;
+        if(o.sweep) cout << " sweep-counts=" << o.sweep_counts << " csv-out=" << o.csv_out;
+        cout << "\n"
+             << "note: benchmark/sweep trials force render=off delay-ms=0 internally\n"
+                "      regardless of the render/delay-ms values printed above\n";
+    }
+    cout << "\n";
     cout.flush();
 }
 
@@ -210,14 +270,58 @@ static void print_board(const Board &b, int totalSteps){
     cout.flush();
 }
 
-int main(int argc, char** argv){
-    signal(SIGINT, on_sigint);
-    ios::sync_with_stdio(false);
-    cin.tie(nullptr);
+// Streaming (Welford) mean/variance, plus the parallel-combine formula
+// (Chan et al.) so per-trial latency distributions can be pooled into one
+// overall mean/stddev across an entire --benchmark or --sweep run without
+// storing every individual sample.
+struct Welford {
+    long long n = 0;
+    double mean = 0.0, M2 = 0.0;
+    void add(double x){
+        n++;
+        double d = x - mean;
+        mean += d / n;
+        double d2 = x - mean;
+        M2 += d * d2;
+    }
+    double stddev() const { return n > 1 ? sqrt(M2 / (n - 1)) : 0.0; }
+};
+static Welford combine(const Welford &a, const Welford &b){
+    if(a.n == 0) return b;
+    if(b.n == 0) return a;
+    Welford c;
+    c.n = a.n + b.n;
+    double delta = b.mean - a.mean;
+    c.mean = a.mean + delta * b.n / c.n;
+    c.M2 = a.M2 + b.M2 + delta * delta * (double)a.n * b.n / c.n;
+    return c;
+}
 
-    Options opt = parseArgs(argc, argv);
-    printConfig(opt); // always printed, even with --no-render, so a stress run's
-                       // actual effective parameters can be confirmed from stdout
+struct TrialResult {
+    long long ticks = 0;
+    double elapsedSec = 0.0;
+    double throughputTPS = 0.0;
+    Welford latencyUs;          // inter-tick latency samples, microseconds
+    double lockWaitPct = -1.0;  // -1 = not measured (LOCK_INSTRUMENTATION not compiled in)
+    int winner = -1;
+    vector<int> steps;
+};
+
+// Runs one full game/trial: builds a fresh Board, places walls and agents,
+// spawns opt.toons worker threads, runs to completion, joins, and returns
+// timing/outcome data. This is the single simulation core shared by the
+// interactive single-run path, --benchmark, and --sweep -- it is NOT
+// reimplemented separately for benchmarking, so the measured throughput
+// and latency reflect the exact same lock-acquisition pattern (BoardLock/
+// RenderLock, same critical sections) as normal play.
+//
+// opt.benchmark changes two things: the "reach the flag" win condition no
+// longer ends the game early (the trial always runs the full opt.maxSteps
+// ticks, giving every trial and every agent count a directly comparable,
+// fixed amount of work), and inter-tick latency is sampled via the Welford
+// accumulator below. Everything else -- movement, jump, shoot/freeze,
+// burst, locking -- is identical to non-benchmark play.
+static TrialResult runOneGame(Options opt){
     Board board(opt.rows, opt.cols, opt.toons);
     assignIdentities(board, opt.toons);
 
@@ -275,7 +379,50 @@ int main(int argc, char** argv){
         this_thread::sleep_for(milliseconds(opt.delay_ms)); // respect pacing when logging
     };
 
+    // Inter-tick latency accumulator (benchmark mode only). Every totalSteps
+    // increment already happens while board.mtx is held (all three sites
+    // below are inside a BoardLock scope), so recording "time since the
+    // previous tick" here needs no extra synchronization -- it rides the
+    // same critical section that was already exclusive.
+    //
+    // `measuring` brackets sample collection to exactly the same
+    // [trialStart, trialEnd] window used for the tick-count/throughput
+    // measurement below (both flip via this one flag). Without this, a
+    // tick from thread spawn (before trialStart) or from the post-signal
+    // drain period (worker threads only re-check gameOver at the top of
+    // their loop, so up to ~toons of them can each complete one more tick
+    // after trialEnd before exiting) would be sampled too -- this was
+    // caught empirically: latency sample counts were running ~2x the
+    // configured ticks/trial before this flag was added.
+    atomic<bool> measuring(false);
+    Welford latencyUs;
+    bool haveLastTick = false;
+    time_point<steady_clock> lastTick;
+    auto recordTick = [&](){
+        if(!opt.benchmark || !measuring.load()) return;
+        auto t = now();
+        if(haveLastTick) latencyUs.add(duration<double, micro>(t - lastTick).count());
+        haveLastTick = true;
+        lastTick = t;
+    };
+
+#ifdef LOCK_INSTRUMENTATION
+    // Per-thread wait time and the thread's OWN lifetime (creation to exit),
+    // not the trial's [trialStart, trialEnd] window: tlBoardWaitNs starts
+    // accumulating the moment a thread is created (before the main thread
+    // even finishes spawning the rest), so dividing it by the trial's
+    // elapsed time produced nonsensical >100% wait percentages (found
+    // empirically: 110% and 196% at toons=1000/10000). Measuring each
+    // thread against its own start-to-exit span keeps numerator and
+    // denominator in the same window, so the ratio is always in [0,100].
+    vector<long long> trialWaitNs(opt.toons, 0), trialHoldNs(opt.toons, 0);
+    vector<double> trialThreadLifeSec(opt.toons, 0.0);
+#endif
+
     auto worker = [&](int t){
+#ifdef LOCK_INSTRUMENTATION
+        auto threadStart = steady_clock::now();
+#endif
         int role = t % 3;
         mt19937 trng(opt.seed + 777u*(t+1));
         uniform_real_distribution<double> chance(0.0, 1.0);
@@ -332,6 +479,7 @@ int main(int argc, char** argv){
                     if(try_move(hop)){
                         rebuild_grid(board);
                         int ts = ++totalSteps;
+                        recordTick();
                         if(opt.render){
                             print_board(board, ts);
                             // board.mtx (BoardLock above) is still held here; log_event
@@ -344,11 +492,15 @@ int main(int argc, char** argv){
                 // Normal move
                 if(!moved && try_move(nxt)){
                     rebuild_grid(board); int ts = ++totalSteps;
+                    recordTick();
                     if(opt.render) print_board(board, ts);
                 }
 
-                // Win check
-                if(!gameOver.load()){
+                // Win check (skipped in benchmark mode: every trial runs the
+                // full opt.maxSteps ticks regardless of who's closest to the
+                // flag, so all trials and all agent counts do the same
+                // amount of work and are directly comparable).
+                if(!opt.benchmark && !gameOver.load()){
                     Pos p = board.toonPos[t];
                     if((p.r==board.flag.r && p.c==board.flag.c) || p.c >= board.finishCol-1){
                         winner.store(t); gameOver.store(true);
@@ -409,6 +561,7 @@ int main(int argc, char** argv){
                     if(board.inBounds(nxt.r,nxt.c) && nxt.c < board.finishCol && board.cell[nxt.r][nxt.c] != '#' && !occ(nxt.r,nxt.c)){
                         board.toonPos[t] = nxt; board.steps[t]++;
                         rebuild_grid(board); int ts = ++totalSteps;
+                        recordTick();
                         if(opt.render) print_board(board, ts);
                     }
                 }
@@ -417,34 +570,219 @@ int main(int argc, char** argv){
             // Global pacing so stacked frames feel smooth
             if(opt.delay_ms > 0) this_thread::sleep_for(milliseconds(opt.delay_ms));
         }
+
+#ifdef LOCK_INSTRUMENTATION
+        if(opt.benchmark){
+            trialWaitNs[t] = tlBoardWaitNs;
+            trialHoldNs[t] = tlBoardHoldNs;
+            trialThreadLifeSec[t] = duration<double>(steady_clock::now() - threadStart).count();
+        }
+#endif
     };
 
     vector<thread> workers; workers.reserve(opt.toons);
+    time_point<steady_clock> trialStart{}, trialEnd{};
+    long long ticksAtStart = 0, ticksAtEnd = 0;
     for(int t=0;t<opt.toons;t++) workers.emplace_back(worker, t);
-
-    // Stop on: a winner, Ctrl+C, or hitting the step cap (max-steps was
-    // previously parsed but never enforced anywhere — a no-op flag).
-    while(!gameOver.load() && !gStop.load() && totalSteps.load() < opt.maxSteps){
-        this_thread::sleep_for(milliseconds(5));
+    if(opt.benchmark){
+        // Snapshot both the tick counter and the clock together, excluding
+        // thread-creation overhead from the measured window.
+        ticksAtStart = totalSteps.load();
+        trialStart = now();
+        measuring.store(true);
     }
-    bool stepLimitReached = !gameOver.load() && !gStop.load() && totalSteps.load() >= opt.maxSteps;
-    gameOver.store(true); // release any workers still waiting on gameOver (step-limit / Ctrl+C cases)
-    for(auto &th : workers) th.join();
 
-    // Final board
-    if(opt.render){
-        rebuild_grid(board);
-        print_board(board, totalSteps.load());
-    }
-    cout << "=== Final Summary ===\n";
-    cout << "total steps: " << totalSteps.load() << "\n";
-    if(winner.load()>=0){
-        for(int t=0;t<opt.toons;t++) cout << board.toonNm[t] << " (" << board.toonCh[t] << ") steps: " << board.steps[t] << "\n";
-        cout << "Winner: " << board.toonNm[winner.load()] << "\n";
-    } else if(stepLimitReached){
-        cout << "No winner — step limit (" << opt.maxSteps << ") reached.\n";
+    if(opt.benchmark){
+        // Gate on the WINDOWED tick count (since ticksAtStart), not the raw
+        // counter -- otherwise ticks produced during thread spawn (before
+        // trialStart) would eat into the budget and shorten the measured
+        // window at high agent counts, making throughput noisier exactly
+        // where it matters most.
+        while((totalSteps.load() - ticksAtStart) < opt.maxSteps && !gStop.load()){
+            this_thread::sleep_for(microseconds(200));
+        }
+        trialEnd = now();
+        ticksAtEnd = totalSteps.load();
+        measuring.store(false);
+        gameOver.store(true);
     } else {
-        cout << "No winner — interrupted.\n";
+        // Stop on: a winner, Ctrl+C, or hitting the step cap (max-steps was
+        // previously parsed but never enforced anywhere — a no-op flag).
+        while(!gameOver.load() && !gStop.load() && totalSteps.load() < opt.maxSteps){
+            this_thread::sleep_for(milliseconds(5));
+        }
+        gameOver.store(true); // release any workers still waiting on gameOver (step-limit / Ctrl+C cases)
     }
+    for(auto &th : workers) th.join(); // join excluded from timed window too
+
+    TrialResult res;
+    res.winner = winner.load();
+    res.steps.assign(board.steps.begin(), board.steps.end());
+    if(opt.benchmark){
+        // Ticks counted here are exactly those produced within
+        // [trialStart, trialEnd] -- NOT totalSteps.load() taken after join,
+        // which would include however many extra ticks in-flight worker
+        // threads completed while draining down to their next gameOver
+        // check (up to ~toons extra ticks at high agent counts: found this
+        // via a ~2x overshoot at toons=10000 before this fix landed).
+        res.ticks = ticksAtEnd - ticksAtStart;
+        res.elapsedSec = duration<double>(trialEnd - trialStart).count();
+        res.throughputTPS = res.elapsedSec > 0 ? res.ticks / res.elapsedSec : 0.0;
+        res.latencyUs = latencyUs;
+#ifdef LOCK_INSTRUMENTATION
+        {
+            double sumPct = 0; int counted = 0;
+            for(int t=0;t<opt.toons;t++){
+                if(trialThreadLifeSec[t] > 0){
+                    sumPct += (trialWaitNs[t] / 1e9) / trialThreadLifeSec[t] * 100.0;
+                    counted++;
+                }
+            }
+            res.lockWaitPct = counted > 0 ? sumPct / counted : 0.0;
+        }
+#endif
+    } else {
+        res.ticks = totalSteps.load();
+    }
+
+    if(!opt.benchmark){
+        bool stepLimitReached = res.winner < 0 && !gStop.load() && res.ticks >= opt.maxSteps;
+        if(opt.render){
+            rebuild_grid(board);
+            print_board(board, res.ticks);
+        }
+        cout << "=== Final Summary ===\n";
+        cout << "total steps: " << res.ticks << "\n";
+        if(res.winner>=0){
+            for(int t=0;t<opt.toons;t++) cout << board.toonNm[t] << " (" << board.toonCh[t] << ") steps: " << board.steps[t] << "\n";
+            cout << "Winner: " << board.toonNm[res.winner] << "\n";
+        } else if(stepLimitReached){
+            cout << "No winner — step limit (" << opt.maxSteps << ") reached.\n";
+        } else {
+            cout << "No winner — interrupted.\n";
+        }
+    }
+    return res;
+}
+
+struct AggResult {
+    int toons = 0;
+    int trials = 0;
+    long long ticksPerTrial = 0;
+    double throughputMean = 0.0, throughputStddev = 0.0;
+    double latencyMeanUs = 0.0, latencyStddevUs = 0.0;
+    long long latencyN = 0;
+    double lockWaitPctMean = -1.0; // -1 = not measured
+};
+
+// Runs nTrials independent trials at opt.toons (each with a distinct seed:
+// opt.seed + trial index, both to avoid replaying the exact same initial
+// layout and because thread-scheduling variance means repeats of the same
+// seed aren't bit-identical anyway -- see docs/BENCHMARKS.md), aggregates
+// throughput as mean/stddev across trials, and pools every trial's inter-
+// tick latency samples into one overall mean/stddev via Welford's parallel
+// combine formula.
+static AggResult runTrials(Options opt, int nTrials){
+    opt.benchmark = true;
+    opt.render = false;
+    opt.delay_ms = 0;
+
+    vector<double> throughputs;
+    throughputs.reserve(nTrials);
+    Welford pooledLatency;
+    double lockWaitSum = 0.0;
+    int lockWaitCount = 0;
+
+    for(int i=0;i<nTrials;i++){
+        Options trialOpt = opt;
+        trialOpt.seed = opt.seed + (unsigned)i;
+        TrialResult r = runOneGame(trialOpt);
+        throughputs.push_back(r.throughputTPS);
+        pooledLatency = combine(pooledLatency, r.latencyUs);
+        if(r.lockWaitPct >= 0){ lockWaitSum += r.lockWaitPct; lockWaitCount++; }
+    }
+
+    AggResult agg;
+    agg.toons = opt.toons;
+    agg.trials = nTrials;
+    agg.ticksPerTrial = opt.maxSteps;
+    double sum = 0; for(double v : throughputs) sum += v;
+    agg.throughputMean = sum / nTrials;
+    double sq = 0; for(double v : throughputs) sq += (v - agg.throughputMean) * (v - agg.throughputMean);
+    agg.throughputStddev = nTrials > 1 ? sqrt(sq / (nTrials - 1)) : 0.0;
+    agg.latencyMeanUs = pooledLatency.mean;
+    agg.latencyStddevUs = pooledLatency.stddev();
+    agg.latencyN = pooledLatency.n;
+    agg.lockWaitPctMean = lockWaitCount > 0 ? lockWaitSum / lockWaitCount : -1.0;
+    return agg;
+}
+
+static void printAgg(const AggResult &a){
+    cout << "=== Benchmark: toons=" << a.toons << " trials=" << a.trials
+         << " ticks/trial=" << a.ticksPerTrial << " ===\n";
+    cout << fixed << setprecision(1);
+    cout << "Throughput: mean=" << a.throughputMean << " ticks/sec  stddev="
+         << a.throughputStddev << " ticks/sec\n";
+    cout << setprecision(2);
+    cout << "Frame latency: mean=" << a.latencyMeanUs << " us  stddev="
+         << a.latencyStddevUs << " us  (n=" << a.latencyN << " samples)\n";
+    if(a.lockWaitPctMean >= 0){
+        cout << setprecision(1);
+        cout << "Lock wait: mean=" << a.lockWaitPctMean
+             << "% of thread wall-clock time blocked on board.mtx\n";
+    }
+    cout.unsetf(ios::fixed);
+    cout << "\n";
+    cout.flush();
+}
+
+static void runBenchmarkOnly(const Options &opt){
+    AggResult a = runTrials(opt, opt.benchmark_trials);
+    printAgg(a);
+}
+
+static vector<int> parseIntList(const string &s){
+    vector<int> out;
+    string cur;
+    for(char c : s){
+        if(c==','){ if(!cur.empty()){ out.push_back(stoi(cur)); cur.clear(); } }
+        else cur += c;
+    }
+    if(!cur.empty()) out.push_back(stoi(cur));
+    return out;
+}
+
+static void runSweep(const Options &opt){
+    vector<int> counts = parseIntList(opt.sweep_counts);
+    ofstream csv(opt.csv_out);
+    csv << "agent_count,trials,ticks_per_trial,throughput_mean_tps,throughput_stddev_tps,"
+           "latency_mean_us,latency_stddev_us,lock_wait_pct\n";
+    for(int n : counts){
+        Options o = opt;
+        o.toons = n;
+        AggResult a = runTrials(o, opt.benchmark_trials);
+        printAgg(a);
+        csv << a.toons << "," << a.trials << "," << a.ticksPerTrial << ","
+            << a.throughputMean << "," << a.throughputStddev << ","
+            << a.latencyMeanUs << "," << a.latencyStddevUs << ","
+            << (a.lockWaitPctMean >= 0 ? to_string(a.lockWaitPctMean) : "") << "\n";
+        csv.flush();
+    }
+    cout << "Sweep results written to " << opt.csv_out << "\n";
+}
+
+int main(int argc, char** argv){
+    signal(SIGINT, on_sigint);
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+
+    Options opt = parseArgs(argc, argv);
+    printConfig(opt); // always printed, even with --no-render, so a stress run's
+                       // actual effective parameters can be confirmed from stdout
+
+    if(opt.sweep){ runSweep(opt); return 0; }
+    if(opt.benchmark){ runBenchmarkOnly(opt); return 0; }
+
+    runOneGame(opt);
     return 0;
 }

@@ -9,7 +9,19 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(SANITIZER "none" CACHE STRING "Sanitizer build: none|thread|address")
 set_property(CACHE SANITIZER PROPERTY STRINGS none thread address)
 
+# Lock-contention instrumentation, opt-in and separate from the sanitizer
+# builds above: times every board.mtx acquisition/release (see BoardLock in
+# src/main.cpp). This overhead would skew the real throughput/latency
+# numbers, so it lives in its own build directory and is never combined
+# with -DSANITIZER or with the numbers used for the actual benchmark:
+#   cmake -S . -B build-instrumented -DLOCK_INSTRUMENTATION=ON -DCMAKE_BUILD_TYPE=Release
+option(LOCK_INSTRUMENTATION "Instrument board.mtx wait/hold time (skews throughput; separate build only)" OFF)
+
 add_executable(toons src/main.cpp)
+
+if(LOCK_INSTRUMENTATION)
+  target_compile_definitions(toons PRIVATE LOCK_INSTRUMENTATION)
+endif()
 
 if(UNIX AND NOT APPLE)
   target_link_libraries(toons pthread)
