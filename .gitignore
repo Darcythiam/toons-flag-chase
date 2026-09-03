@@ -2,3 +2,4 @@ build/
 build-tsan/
 build-asan/
 build-instrumented/
+/toons
