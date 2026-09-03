@@ -103,7 +103,57 @@ steps: 63
 ## 🧮 Notes
 
 * Each Toon runs independently with mutex synchronization.
-* YosemiteSam’s cooldown and freeze logic run on separate detached threads.
+* YosemiteSam’s cooldown and freeze state are per-agent timestamps checked
+  under `board.mtx` — no timer threads are spawned (see Concurrency
+  Invariants below for why that changed).
 * Coyote’s jump only triggers if movement is blocked.
 * RoadRunner’s burst step is small but frequent, making him visually faster.
+
+---
+
+## 🔒 Concurrency Invariants
+
+This is a **single-global-lock design**: `board.mtx` is the only lock
+guarding shared board state, and every access to it goes through the same
+mutex — agent positions (`toonPos`), freeze deadlines (`frozen_until`),
+shoot cooldowns (`next_shot_ok`), per-agent step counts (`steps`), and the
+render grid (`cell`/`grid`, via `rebuild_grid`). There is no per-agent or
+per-field sharding; a worker thread touching any of that state acquires the
+exact same `board.mtx` that every other worker acquires.
+
+A second mutex, `render_mtx`, exists purely to serialize `stdout` writes
+inside `log_event` (the small "[Update] ... " event lines). It is
+completely independent of board state — it protects nothing but `cout`.
+
+**Lock order.** The two call sites of `log_event` (Coyote's jump message
+and YosemiteSam's shoot message, in `src/main.cpp`) both execute while the
+surrounding `board.mtx` critical section is still open, so `render_mtx` is
+always acquired *underneath* an already-held `board.mtx`. The invariant is:
+
+> `board.mtx` is always acquired before `render_mtx`; `render_mtx` is never
+> held while attempting to acquire `board.mtx`.
+
+Because there is exactly one lock in the board-state critical path
+(`render_mtx` never nests the other way around it), lock-order deadlock is
+structurally impossible here by construction, not by convention — there's
+no second board-state lock to acquire out of order. To keep it that way as
+the code changes, every acquisition site uses `BoardLock`/`RenderLock`
+(thin RAII wrappers around `board.mtx`/`board.render_mtx` in
+`src/main.cpp`) instead of a bare `lock_guard`. `RenderLock` sets a
+thread-local flag while `render_mtx` is held; `BoardLock` asserts that flag
+is clear before locking `board.mtx`. In a debug build (no `-DNDEBUG` — true
+for the TSan/ASan configs in `docs/SANITIZERS.md`, false for the default
+Release build) a future contributor who adds a `render_mtx`-then-`board.mtx`
+path will hit that assertion immediately instead of introducing a latent
+deadlock.
+
+**Why this matters, concretely:** the single-lock design is *why* the
+`frozen_until` data race documented in `docs/SANITIZERS.md` was possible in
+the first place. It wasn't a case of two locks racing each other or being
+acquired out of order — `board.mtx` already covered every write to
+`frozen_until`. The bug was a *read* of `board.frozen_until[t]` that simply
+never took `board.mtx` at all, bypassing the one lock that existed rather
+than exposing a gap between two locks. The fix was closing that unguarded
+read (taking `board.mtx` for it, same as every other access), not adding a
+second lock — there was, and still is, only one lock guarding board state.
 

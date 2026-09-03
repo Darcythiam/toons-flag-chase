@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <chrono>
 #include <csignal>
 #include <functional>
@@ -39,6 +40,39 @@ struct Options {
 
 static atomic<bool> gStop(false);
 void on_sigint(int){ gStop.store(true); }
+
+// Lock-order invariant (see README "Concurrency Invariants"): board.mtx is
+// always acquired before render_mtx; render_mtx is never held while this
+// thread attempts to acquire board.mtx. These RAII wrappers replace plain
+// lock_guard<mutex> at every acquisition site so a future violation trips
+// the assert below (debug builds only -- a no-op under NDEBUG) instead of
+// silently opening a lock-order deadlock.
+static thread_local bool holding_render_mtx = false;
+
+struct BoardLock {
+    explicit BoardLock(mutex &m) : m_(m) {
+        assert(!holding_render_mtx &&
+               "lock-order violation: board.mtx acquired while render_mtx held");
+        m_.lock();
+    }
+    ~BoardLock(){ m_.unlock(); }
+    BoardLock(const BoardLock&) = delete;
+    BoardLock& operator=(const BoardLock&) = delete;
+private:
+    mutex &m_;
+};
+
+struct RenderLock {
+    explicit RenderLock(mutex &m) : m_(m) {
+        m_.lock();
+        holding_render_mtx = true;
+    }
+    ~RenderLock(){ holding_render_mtx = false; m_.unlock(); }
+    RenderLock(const RenderLock&) = delete;
+    RenderLock& operator=(const RenderLock&) = delete;
+private:
+    mutex &m_;
+};
 
 struct Board {
     int R, C;
@@ -142,6 +176,19 @@ Options parseArgs(int argc, char** argv){
     return o;
 }
 
+static void printConfig(const Options &o){
+    cout << "=== Config ===\n"
+         << "rows=" << o.rows << " cols=" << o.cols << " toons=" << o.toons
+         << " max-steps=" << o.maxSteps << " seed=" << o.seed << "\n"
+         << "delay-ms=" << o.delay_ms << " render=" << (o.render ? "on" : "off") << "\n"
+         << "rr-burst-chance=" << o.rr_burst_chance
+         << " jump-chance=" << o.coy_jump_chance
+         << " shoot-chance=" << o.sam_shoot_chance
+         << " shoot-cooldown-ms=" << o.sam_cooldown_ms
+         << " freeze-ms=" << o.sam_freeze_ms << "\n\n";
+    cout.flush();
+}
+
 static void rebuild_grid(Board &b){
     for(int r=0;r<b.R;r++) for(int c=0;c<b.C;c++) b.grid[r][c] = b.cell[r][c];
     for(int r=0;r<b.R;r++) b.grid[r][b.finishCol] = '|';
@@ -169,6 +216,8 @@ int main(int argc, char** argv){
     cin.tie(nullptr);
 
     Options opt = parseArgs(argc, argv);
+    printConfig(opt); // always printed, even with --no-render, so a stress run's
+                       // actual effective parameters can be confirmed from stdout
     Board board(opt.rows, opt.cols, opt.toons);
     assignIdentities(board, opt.toons);
 
@@ -191,7 +240,7 @@ int main(int argc, char** argv){
     // linear-scan fallback so a dense board (e.g. --toons close to rows*cols)
     // can't spin the do-while loop forever.
     {
-        lock_guard<mutex> lk(board.mtx);
+        BoardLock lk(board.mtx);
         vector<vector<bool>> used(board.R, vector<bool>(board.C, false));
         used[board.flag.r][board.flag.c] = true;
         for(int t=0;t<opt.toons;t++){
@@ -220,7 +269,7 @@ int main(int argc, char** argv){
     auto now = []{ return steady_clock::now(); };
 
     auto log_event = [&](const string &msg){
-        lock_guard<mutex> lk(board.render_mtx);
+        RenderLock lk(board.render_mtx);
         cout << msg << "\n\n"; // small text + space after
         cout.flush();
         this_thread::sleep_for(milliseconds(opt.delay_ms)); // respect pacing when logging
@@ -244,7 +293,7 @@ int main(int argc, char** argv){
             // below when YosemiteSam freezes a target).
             bool isFrozen;
             {
-                lock_guard<mutex> lk(board.mtx);
+                BoardLock lk(board.mtx);
                 isFrozen = now() < board.frozen_until[t];
             }
             if(isFrozen){ this_thread::sleep_for(base_sleep); continue; }
@@ -252,7 +301,7 @@ int main(int argc, char** argv){
             // Bias toward flag most of the time
             Pos step{0,0};
             {
-                lock_guard<mutex> lk(board.mtx);
+                BoardLock lk(board.mtx);
                 Pos cur = board.toonPos[t];
                 Pos dir{ (board.flag.r > cur.r) - (board.flag.r < cur.r),
                          (board.flag.c > cur.c) - (board.flag.c < cur.c) };
@@ -265,7 +314,7 @@ int main(int argc, char** argv){
 
             bool moved=false;
             {
-                lock_guard<mutex> lk(board.mtx);
+                BoardLock lk(board.mtx);
                 Pos cur = board.toonPos[t];
                 Pos nxt{cur.r + step.r, cur.c + step.c};
                 auto occ = [&](int r,int c){ for(size_t k=0;k<board.toonPos.size();k++) if((int)k!=t){ if(board.toonPos[k].r==r && board.toonPos[k].c==c) return true;} return false; };
@@ -285,6 +334,9 @@ int main(int argc, char** argv){
                         int ts = ++totalSteps;
                         if(opt.render){
                             print_board(board, ts);
+                            // board.mtx (BoardLock above) is still held here; log_event
+                            // acquires render_mtx underneath it. board.mtx -> render_mtx
+                            // is the only permitted order (see README).
                             log_event("[Update] " + board.toonNm[t] + " jumps to (" + to_string(hop.r) + "," + to_string(hop.c) + ")");
                         }
                     }
@@ -315,13 +367,13 @@ int main(int argc, char** argv){
             if(role==YOSEMITESAM && !gameOver.load()){
                 bool onCooldown;
                 {
-                    lock_guard<mutex> lk(board.mtx);
+                    BoardLock lk(board.mtx);
                     onCooldown = now() < board.next_shot_ok[t];
                 }
                 if(!onCooldown && chance(trng) < opt.sam_shoot_chance){
                     int target=-1; int bestD=1e9;
                     {
-                        lock_guard<mutex> lk(board.mtx);
+                        BoardLock lk(board.mtx);
                         for(int k=0;k<opt.toons;k++) if(k!=t){
                             if(now() < board.frozen_until[k]) continue;
                             int d = abs(board.toonPos[k].r - board.toonPos[t].r) + abs(board.toonPos[k].c - board.toonPos[t].c);
@@ -334,6 +386,8 @@ int main(int argc, char** argv){
                             int ts = totalSteps.load();
                             if(opt.render){
                                 print_board(board, ts);
+                                // board.mtx (BoardLock above) is still held here; same
+                                // board.mtx -> render_mtx order as the Coyote jump case.
                                 log_event("[Update] " + board.toonNm[t] + " shoots " + board.toonNm[target] + " — frozen for " + to_string(opt.sam_freeze_ms) + " ms");
                             }
                         }
@@ -344,7 +398,7 @@ int main(int argc, char** argv){
             // RoadRunner-role: occasional burst (extra step toward flag)
             if(role==ROADRUNNER && moved && !gameOver.load()){
                 if(uniform_real_distribution<double>(0.0,1.0)(trng) < opt.rr_burst_chance){
-                    lock_guard<mutex> lk(board.mtx);
+                    BoardLock lk(board.mtx);
                     Pos cur = board.toonPos[t];
                     Pos dir{ (board.flag.r > cur.r) - (board.flag.r < cur.r),
                              (board.flag.c > cur.c) - (board.flag.c < cur.c) };
