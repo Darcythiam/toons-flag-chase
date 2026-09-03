@@ -26,6 +26,7 @@ struct Options {
 
     // Output pacing & stacked style
     bool stacked = true;      // print NEW board for each update (matches your sample)
+    bool render = true;       // set false (--no-render) to skip board/event I/O for stress runs
     int delay_ms = 120;       // wait between printed boards (enhances realism)
 
     // Ability tuning
@@ -49,22 +50,51 @@ struct Board {
     mutex mtx;                           // state lock
     mutex render_mtx;                    // serialize printing
 
-    vector<Pos> toonPos;                 // R, C, Y positions
-    vector<time_point<steady_clock>> frozen_until;
+    vector<Pos> toonPos;                 // per-toon position
+    vector<time_point<steady_clock>> frozen_until;   // guarded by mtx
+    vector<time_point<steady_clock>> next_shot_ok;   // guarded by mtx: per-toon shoot cooldown
     vector<int> steps;                   // per-toon step count
+    vector<char> toonCh;                 // per-toon glyph
+    vector<string> toonNm;               // per-toon display name
 
     Board(int r, int c, int nToons)
       : R(r), C(c), grid(r, string(c, '.')), cell(r, vector<char>(c, '.')),
-        finishCol(c-1), toonPos(nToons), frozen_until(nToons), steps(nToons,0) {
+        finishCol(c-1), toonPos(nToons), frozen_until(nToons),
+        next_shot_ok(nToons), steps(nToons,0) {
         flag = {R/2, C-2};
-        for (int t=0;t<nToons;t++) frozen_until[t] = steady_clock::time_point::min();
+        for (int t=0;t<nToons;t++){
+            frozen_until[t] = steady_clock::time_point::min();
+            next_shot_ok[t] = steady_clock::time_point::min();
+        }
     }
     bool inBounds(int r, int c) const { return (r>=0 && r<R && c>=0 && c<C); }
 };
 
-enum Toon { ROADRUNNER=0, COYOTE=1, YOSEMITESAM=2 }; // R, C, Y
-static const vector<char>   TOON_CH = {'R','C','Y'};
-static const vector<string> TOON_NM = {"RoadRunner","Coyote","YosemiteSam"};
+// Ability role — cycles every 3 toons so large --toons counts still exercise
+// all three ability code paths (shoot/freeze, jump, burst) under stress.
+enum Toon { ROADRUNNER=0, COYOTE=1, YOSEMITESAM=2 };
+
+static void assignIdentities(Board &b, int nToons){
+    static const char*  names[3] = {"RoadRunner","Coyote","YosemiteSam"};
+    static const char   chars[3] = {'R','C','Y'};
+    // Extra glyphs for toons beyond the first 3 (cosmetic only; board rendering
+    // isn't unique per-agent at high counts, which is fine since stress runs
+    // use --no-render).
+    static const char   extra[]  = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!$%&*+=?<>~^";
+    constexpr int nExtra = sizeof(extra) - 1;
+    b.toonCh.resize(nToons);
+    b.toonNm.resize(nToons);
+    for(int t=0; t<nToons; t++){
+        int role = t % 3;
+        if(t < 3){
+            b.toonCh[t] = chars[role];
+            b.toonNm[t] = names[role];
+        } else {
+            b.toonCh[t] = extra[(t-3) % nExtra];
+            b.toonNm[t] = string(names[role]) + "#" + to_string(t);
+        }
+    }
+}
 
 static inline Pos pick_step(mt19937 &rng){
     static const Pos dirs[5] = {{-1,0},{1,0},{0,-1},{0,1},{0,0}}; // 4-neigh + stay
@@ -88,22 +118,24 @@ Options parseArgs(int argc, char** argv){
         else if(a=="--shoot-cooldown") next(o.sam_cooldown_ms);
         else if(a=="--freeze-ms") next(o.sam_freeze_ms);
         else if(a=="--jump-chance") { if(i+1<argc) o.coy_jump_chance = stod(argv[++i]); }
+        else if(a=="--no-render") o.render = false;
         else if(a=="--help"){
             cout << "Options\n"
                  << "  --rows N             (default 18)\n"
                  << "  --cols N             (default 36)\n"
-                 << "  --toons N            (default 3: R,C,Y)\n"
-                 << "  --max-steps N        (default 10000)\n"
+                 << "  --toons N            (default 3; any positive N, roles R/C/Y cycle)\n"
+                 << "  --max-steps N        (default 10000; hard cap on total steps taken)\n"
                  << "  --seed N             (default time)\n"
                  << "  --delay-ms N         (default 120)\n"
                  << "  --shoot-chance X     (default 0.15)\n"
                  << "  --shoot-cooldown N   (ms, default 1500)\n"
                  << "  --freeze-ms N        (default 1000)\n"
-                 << "  --jump-chance X      (default 0.25)\n";
+                 << "  --jump-chance X      (default 0.25)\n"
+                 << "  --no-render          (skip per-frame board/event printing; for stress runs)\n";
             exit(0);
         }
     }
-    o.toons = max(1, min(o.toons, 3));
+    o.toons = max(1, o.toons);
     o.rows = max(5, o.rows);
     o.cols = max(20, o.cols);
     o.maxSteps = max(100, o.maxSteps);
@@ -115,7 +147,7 @@ static void rebuild_grid(Board &b){
     for(int r=0;r<b.R;r++) b.grid[r][b.finishCol] = '|';
     b.grid[b.flag.r][b.flag.c] = 'F';
     for(size_t t=0;t<b.toonPos.size();t++){
-        auto p = b.toonPos[t]; b.grid[p.r][p.c] = TOON_CH[t];
+        auto p = b.toonPos[t]; b.grid[p.r][p.c] = b.toonCh[t];
     }
 }
 
@@ -138,6 +170,7 @@ int main(int argc, char** argv){
 
     Options opt = parseArgs(argc, argv);
     Board board(opt.rows, opt.cols, opt.toons);
+    assignIdentities(board, opt.toons);
 
     atomic<bool> gameOver(false);
     atomic<int> winner(-1);
@@ -154,22 +187,36 @@ int main(int argc, char** argv){
         board.cell[r][c] = '#';
     }
 
-    // Random starting positions
+    // Random starting positions. Bounded-attempt rejection sampling with a
+    // linear-scan fallback so a dense board (e.g. --toons close to rows*cols)
+    // can't spin the do-while loop forever.
     {
         lock_guard<mutex> lk(board.mtx);
         vector<vector<bool>> used(board.R, vector<bool>(board.C, false));
         used[board.flag.r][board.flag.c] = true;
         for(int t=0;t<opt.toons;t++){
-            int r,c; do{ r=rr(rng); c=cc(rng);} while(used[r][c] || board.cell[r][c]=='#');
+            int r=-1, c=-1; bool found=false;
+            for(int attempt=0; attempt<10000 && !found; attempt++){
+                int rr_ = rr(rng), cc_ = cc(rng);
+                if(!used[rr_][cc_] && board.cell[rr_][cc_] != '#'){ r=rr_; c=cc_; found=true; }
+            }
+            if(!found){
+                for(int r2=0; r2<board.R && !found; r2++)
+                    for(int c2=0; c2<=board.C-3 && !found; c2++)
+                        if(!used[r2][c2] && board.cell[r2][c2] != '#'){ r=r2; c=c2; found=true; }
+            }
+            if(!found){
+                cerr << "Error: board too small to place " << opt.toons
+                     << " toons; increase --rows/--cols.\n";
+                exit(1);
+            }
             used[r][c]=true; board.toonPos[t] = {r,c};
         }
     }
 
     rebuild_grid(board);
-    print_board(board, totalSteps.load());
+    if(opt.render) print_board(board, totalSteps.load());
 
-    // Ability state
-    atomic<bool> sam_on_cd(false);
     auto now = []{ return steady_clock::now(); };
 
     auto log_event = [&](const string &msg){
@@ -180,18 +227,27 @@ int main(int argc, char** argv){
     };
 
     auto worker = [&](int t){
+        int role = t % 3;
         mt19937 trng(opt.seed + 777u*(t+1));
         uniform_real_distribution<double> chance(0.0, 1.0);
 
-        // Visual pacing per toon (RoadRunner is fastest)
+        // Visual pacing per toon (RoadRunner-role is fastest)
         milliseconds base_sleep(70);
-        if(t==ROADRUNNER) base_sleep = milliseconds(35);
-        else if(t==COYOTE) base_sleep = milliseconds(60);
-        else if(t==YOSEMITESAM) base_sleep = milliseconds(75);
+        if(role==ROADRUNNER) base_sleep = milliseconds(35);
+        else if(role==COYOTE) base_sleep = milliseconds(60);
+        else if(role==YOSEMITESAM) base_sleep = milliseconds(75);
 
         while(!gameOver.load() && !gStop.load()){
-            // If frozen, just wait
-            if(now() < board.frozen_until[t]){ this_thread::sleep_for(base_sleep); continue; }
+            // If frozen, just wait. Read frozen_until under the same mutex
+            // that protects its writes (fixes a TSan-detected data race:
+            // this used to be an unlocked read racing the locked write
+            // below when YosemiteSam freezes a target).
+            bool isFrozen;
+            {
+                lock_guard<mutex> lk(board.mtx);
+                isFrozen = now() < board.frozen_until[t];
+            }
+            if(isFrozen){ this_thread::sleep_for(base_sleep); continue; }
 
             // Bias toward flag most of the time
             Pos step{0,0};
@@ -208,7 +264,6 @@ int main(int argc, char** argv){
             }
 
             bool moved=false;
-            bool printed=false;
             {
                 lock_guard<mutex> lk(board.mtx);
                 Pos cur = board.toonPos[t];
@@ -222,19 +277,22 @@ int main(int argc, char** argv){
 
                 bool blocked = !(board.inBounds(nxt.r,nxt.c) && nxt.c < board.finishCol) || board.cell[nxt.r][nxt.c]=='#' || occ(nxt.r,nxt.c);
 
-                // Coyote: jump over one cell sometimes when blocked
-                if(blocked && t==COYOTE && chance(trng) < opt.coy_jump_chance){
+                // Coyote-role: jump over one cell sometimes when blocked
+                if(blocked && role==COYOTE && chance(trng) < opt.coy_jump_chance){
                     Pos hop{nxt.r + step.r, nxt.c + step.c};
                     if(try_move(hop)){
                         rebuild_grid(board);
-                        int ts = ++totalSteps; printed=true;
-                        print_board(board, ts);
-                        log_event("[Update] Coyote jumps to (" + to_string(hop.r) + "," + to_string(hop.c) + ")");
+                        int ts = ++totalSteps;
+                        if(opt.render){
+                            print_board(board, ts);
+                            log_event("[Update] " + board.toonNm[t] + " jumps to (" + to_string(hop.r) + "," + to_string(hop.c) + ")");
+                        }
                     }
                 }
                 // Normal move
                 if(!moved && try_move(nxt)){
-                    rebuild_grid(board); int ts = ++totalSteps; printed=true; print_board(board, ts);
+                    rebuild_grid(board); int ts = ++totalSteps;
+                    if(opt.render) print_board(board, ts);
                 }
 
                 // Win check
@@ -246,9 +304,21 @@ int main(int argc, char** argv){
                 }
             }
 
-            // YosemiteSam: fire & freeze with cooldown
-            if(t==YOSEMITESAM && !gameOver.load()){
-                if(!sam_on_cd.load() && chance(trng) < opt.sam_shoot_chance){
+            // YosemiteSam-role: fire & freeze with a per-toon cooldown.
+            // Cooldown is tracked as a timestamp guarded by board.mtx instead
+            // of the previous atomic<bool> + detached timer thread: that
+            // detached thread captured stack variables from main() by
+            // reference and could still be sleeping when main() returned,
+            // writing to already-destroyed stack memory (ASan
+            // stack-use-after-scope). A timestamp compared under the same
+            // lock as frozen_until needs no extra thread and can't dangle.
+            if(role==YOSEMITESAM && !gameOver.load()){
+                bool onCooldown;
+                {
+                    lock_guard<mutex> lk(board.mtx);
+                    onCooldown = now() < board.next_shot_ok[t];
+                }
+                if(!onCooldown && chance(trng) < opt.sam_shoot_chance){
                     int target=-1; int bestD=1e9;
                     {
                         lock_guard<mutex> lk(board.mtx);
@@ -257,20 +327,22 @@ int main(int argc, char** argv){
                             int d = abs(board.toonPos[k].r - board.toonPos[t].r) + abs(board.toonPos[k].c - board.toonPos[t].c);
                             if(d < bestD){ bestD=d; target=k; }
                         }
+                        board.next_shot_ok[t] = now() + milliseconds(opt.sam_cooldown_ms);
                         if(target!=-1){
                             board.frozen_until[target] = now() + milliseconds(opt.sam_freeze_ms);
                             rebuild_grid(board); // show positions when shot happens
                             int ts = totalSteps.load();
-                            print_board(board, ts);
-                            log_event("[Update] YosemiteSam shoots " + TOON_NM[target] + " — frozen for " + to_string(opt.sam_freeze_ms) + " ms");
+                            if(opt.render){
+                                print_board(board, ts);
+                                log_event("[Update] " + board.toonNm[t] + " shoots " + board.toonNm[target] + " — frozen for " + to_string(opt.sam_freeze_ms) + " ms");
+                            }
                         }
                     }
-                    sam_on_cd.store(true); std::thread([&]{ std::this_thread::sleep_for(std::chrono::milliseconds(opt.sam_cooldown_ms)); sam_on_cd.store(false); }).detach();
                 }
             }
 
-            // RoadRunner: occasional burst (extra step toward flag)
-            if(t==ROADRUNNER && moved && !gameOver.load()){
+            // RoadRunner-role: occasional burst (extra step toward flag)
+            if(role==ROADRUNNER && moved && !gameOver.load()){
                 if(uniform_real_distribution<double>(0.0,1.0)(trng) < opt.rr_burst_chance){
                     lock_guard<mutex> lk(board.mtx);
                     Pos cur = board.toonPos[t];
@@ -282,29 +354,43 @@ int main(int argc, char** argv){
                     auto occ = [&](int r,int c){ for(size_t k=0;k<board.toonPos.size();k++) if((int)k!=t){ if(board.toonPos[k].r==r && board.toonPos[k].c==c) return true;} return false; };
                     if(board.inBounds(nxt.r,nxt.c) && nxt.c < board.finishCol && board.cell[nxt.r][nxt.c] != '#' && !occ(nxt.r,nxt.c)){
                         board.toonPos[t] = nxt; board.steps[t]++;
-                        rebuild_grid(board); int ts = ++totalSteps; print_board(board, ts);
+                        rebuild_grid(board); int ts = ++totalSteps;
+                        if(opt.render) print_board(board, ts);
                     }
                 }
             }
 
             // Global pacing so stacked frames feel smooth
-            this_thread::sleep_for(milliseconds(opt.delay_ms));
+            if(opt.delay_ms > 0) this_thread::sleep_for(milliseconds(opt.delay_ms));
         }
     };
 
     vector<thread> workers; workers.reserve(opt.toons);
     for(int t=0;t<opt.toons;t++) workers.emplace_back(worker, t);
 
-    while(!gameOver.load() && !gStop.load()) this_thread::sleep_for(milliseconds(5));
+    // Stop on: a winner, Ctrl+C, or hitting the step cap (max-steps was
+    // previously parsed but never enforced anywhere — a no-op flag).
+    while(!gameOver.load() && !gStop.load() && totalSteps.load() < opt.maxSteps){
+        this_thread::sleep_for(milliseconds(5));
+    }
+    bool stepLimitReached = !gameOver.load() && !gStop.load() && totalSteps.load() >= opt.maxSteps;
+    gameOver.store(true); // release any workers still waiting on gameOver (step-limit / Ctrl+C cases)
     for(auto &th : workers) th.join();
 
     // Final board
-    rebuild_grid(board);
-    print_board(board, totalSteps.load());
+    if(opt.render){
+        rebuild_grid(board);
+        print_board(board, totalSteps.load());
+    }
+    cout << "=== Final Summary ===\n";
+    cout << "total steps: " << totalSteps.load() << "\n";
     if(winner.load()>=0){
-        cout << "=== Final Summary ===\n";
-        for(int t=0;t<opt.toons;t++) cout << TOON_NM[t] << " (" << TOON_CH[t] << ") steps: " << board.steps[t] << "\n";
-        cout << "Winner: " << TOON_NM[winner.load()] << "\n";
+        for(int t=0;t<opt.toons;t++) cout << board.toonNm[t] << " (" << board.toonCh[t] << ") steps: " << board.steps[t] << "\n";
+        cout << "Winner: " << board.toonNm[winner.load()] << "\n";
+    } else if(stepLimitReached){
+        cout << "No winner — step limit (" << opt.maxSteps << ") reached.\n";
+    } else {
+        cout << "No winner — interrupted.\n";
     }
     return 0;
 }
