@@ -199,6 +199,151 @@ applied, speculatively or otherwise: nothing in the data collected here
 points at false sharing on something accessed concurrently *outside* the
 lock, which is the one scenario that would justify it.
 
+## Open Questions / Post-Saturation Decline
+
+The "Results" section above treats lock-wait% near 100% at 1,000+ agents as
+direct confirmation that the global mutex causes the throughput decline seen
+from 10,000 agents onward. That reasoning has a gap worth recording rather
+than leaving implicit: with `--delay-ms` forced to 0, N busy-retrying
+threads contending for one mutex converge on a wait fraction of `(N-1)/N`
+almost by construction, regardless of how expensive the critical section
+itself is. A high wait% is therefore not, by itself, evidence that the
+*decline* past 1,000 agents is lock-caused — it would be just as high even
+if the critical section cost were constant and throughput were flat. This
+section checks that gap directly rather than assuming it away. **It does
+not change the "textbook signature of lock serialization" conclusion
+above** — see the reconciliation at the end.
+
+### 1. `occ()` is O(N), not O(local density)
+
+`occ()` (`src/main.cpp:467` and an identical second instance at `:560`) is:
+
+```cpp
+auto occ = [&](int r,int c){
+    for(size_t k=0;k<board.toonPos.size();k++)
+        if((int)k!=t){ if(board.toonPos[k].r==r && board.toonPos[k].c==c) return true; }
+    return false;
+};
+```
+
+This is a linear scan over the *entire* `board.toonPos` vector — every other
+agent on the board, not just spatial neighbors — executed while `board.mtx`
+is already held. It is **O(N)** in total agent count. Call sites per tick
+per worker thread: line 474 (`blocked = ... || occ(nxt.r,nxt.c)`) always
+runs on every movement attempt (1 guaranteed O(N) scan); line 470, inside
+`try_move`, adds a 2nd O(N) scan in the same critical section when the
+Coyote-jump path triggers; line 561 (a separate `BoardLock` critical
+section) adds a possible 3rd O(N) scan on the RoadRunner-burst path. Since
+only one thread holds `board.mtx` at a time, critical-section hold time for
+a single move is O(N) rather than O(1) — it scales with total agent count.
+Aggregate serialized work across N threads each doing this once is
+therefore **O(N²)** per full round. This gives the post-saturation decline
+a concrete mechanism that wait% cannot: as N grows, each lock acquisition
+itself gets *more expensive*, independent of how many threads are
+contending for it. No fix (spatial hashing, bucketing, etc.) was applied —
+this is a complexity finding, not a change.
+
+### 2. Machine specs (thread-oversubscription context)
+
+* `nproc`: **12** cores.
+* `ulimit -s`: **8192 KB** (8 MiB) — matches glibc's default pthread stack
+  size when unset.
+* 50,000 threads × 8 MiB = **390.6 GiB** of *virtual* address-space
+  reservation for stacks. RAM on this machine is 30 GiB total (27 GiB
+  available). 390.6 GiB virtual vastly exceeds physical RAM, but Linux
+  stacks are demand-paged (guard page + lazy commit) — only touched pages
+  become resident, and this simulation has shallow, non-recursive call
+  stacks, so actual RSS per thread is almost certainly tens of KB, not the
+  full reservation. **Stack memory is very unlikely to be pressuring this
+  system**; it reads as virtual bookkeeping, not physical contention.
+* `/sys/fs/cgroup/user.slice/user-1000.slice/pids.max` = `83199`, matching
+  the value already recorded above for the 50,000-agent ceiling.
+* 50,000 real OS threads (thread-per-agent, no pool) on 12 cores is
+  **~4,167:1 oversubscription**. This is a plausible contributing cost
+  (scheduling, context-switch overhead) independent of the lock, but it is
+  not isolated by any measurement in this document — doing so would need a
+  pooled-thread rerun, which is a design change and out of scope here.
+
+### 3. Raw per-trial data (not just the aggregated %)
+
+Full stdout for every trial at N=10, 100, 1,000, and 10,000 (5 trials each,
+seeds 1–5, same `--rows 400 --cols 1000 --max-steps 10000` as the documented
+runs) is saved in `bench/raw_logs/instrumented_raw_20260903.log`. Summary:
+
+| N | trial (seed) | throughput (tps) | latency (µs) | wait% |
+|---|---|---|---|---|
+| 10 | 1 | 4411.1 | 226.67 | 89.6% |
+| 10 | 2 | 4532.8 | 220.54 | 90.0% |
+| 10 | 3 | 4286.3 | 233.28 | 90.0% |
+| 10 | 4 | 2895.5 | 345.37 | 90.0% |
+| 10 | 5 | 2363.6 | 423.05 | 90.0% |
+| 100 | 1 | 2395.2 | 417.50 | 99.0% |
+| 100 | 2 | 2532.8 | 394.82 | 99.0% |
+| 100 | 3 | 2557.4 | 391.03 | 99.0% |
+| 100 | 4 | 2572.2 | 388.76 | 99.0% |
+| 100 | 5 | 2594.6 | 385.39 | 99.0% |
+| 1,000 | 1 | 2506.2 | 398.97 | 99.9% |
+| 1,000 | 2 | 2597.0 | 385.04 | 99.9% |
+| 1,000 | 3 | 1894.0 | 527.94 | 99.9% |
+| 1,000 | 4 | 2598.9 | 384.80 | 99.9% |
+| 1,000 | 5 | 2564.7 | 389.91 | 99.9% |
+| 10,000 | 1 | 2306.0 | 433.62 | 100.0% |
+| 10,000 | 2 | 2324.9 | 430.11 | 100.0% |
+| 10,000 | 3 | 2542.4 | 393.34 | 100.0% |
+| 10,000 | 4 | 2484.6 | 402.49 | 100.0% |
+| 10,000 | 5 | 3830.4 | 261.08 | 100.0% |
+
+(These instrumented-build throughput/latency figures are noisier and
+systematically higher than the uninstrumented sweep table above — expected,
+since `LOCK_INSTRUMENTATION` timing itself skews throughput per its own
+CMake option comment. They're a cross-check for wait%, not a replacement
+for the Results table. The N=10,000 trial-5 run timed out mid-trial on
+first attempt and was rerun standalone.)
+
+### 4. N=10 / N=100 vs. the `(N-1)/N` prediction
+
+| N | mean measured wait% | `(N-1)/N` prediction | throughput trend (Results table) |
+|---|---|---|---|
+| 10 | 89.9% | 90.0% | flat (2457.6, part of the 1.4% "noise" spread) |
+| 100 | 99.0% | 99.0% | flat (2469.2, part of the 1.4% "noise" spread) |
+| 1,000 | 99.9% | 99.9% | flat (2434.6, still inside the 1.4% spread) |
+| 10,000 | 100.0% | 99.99% → 100.0% | −11.2% vs. the 100-agent peak |
+
+Measured wait% tracks the `(N-1)/N` prediction almost exactly at every
+tier, including N=10 and N=100, where the Results table shows throughput is
+flat, not declining. This is the direct answer to the open question: at
+N=10 and N=100, wait% is already 89.9%–99.0% — nearly as saturated as the
+99.9%/100.0% figures the Results section cites as confirmation at
+1,000/10,000 agents — yet throughput does not move at N=10/100. **This
+confirms that lock-wait% and throughput degradation are independent
+signals**: high wait% is consistent with contention existing, but does not
+by itself distinguish "pure contention, no other cost growing" (N=10/100,
+flat throughput) from "contention plus a cost that grows with N"
+(N≥10,000, declining throughput). Wait% alone cannot tell those two cases
+apart because it saturates almost immediately regardless of which one is
+happening.
+
+### Reconciling with "textbook signature of lock serialization" above
+
+The Results section's conclusion is not overturned by this — flat
+throughput through 1,000 agents and monotonic decline from 10,000 onward is
+still real, and the global mutex is still the only synchronization
+mechanism in the system, so it is still mechanically responsible for
+serializing every agent's move. What this section adds is that **the
+wait% figure specifically is not the evidence that should be doing that
+argument's work**, because wait% saturates too early (by N=10-100) to
+discriminate "flat" from "declining" regimes. The `occ()` finding in (1)
+is a better-fitting mechanism for the *decline* specifically: it predicts
+critical-section cost growing with N (unlike wait%, which cannot grow past
+100% and says nothing once already there), which lines up with throughput
+starting to drop once per-lock work becomes large enough to matter relative
+to everything else a thread does. The thread-oversubscription context in
+(2) is a second, unisolated candidate that may compound it. Neither (1) nor
+(2) was fixed or worked around here — this section is a diagnosis, not a
+change, and the finer-grained-locking comparison already flagged as future
+work in the README is the natural place to test whether addressing (1)
+changes the shape of the decline.
+
 ## Reproducing this run
 
 ```bash

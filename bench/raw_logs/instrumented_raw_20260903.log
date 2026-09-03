@@ -1,0 +1,293 @@
+===== N=10 =====
+--- trial 0 (seed=1) ---
+=== Config ===
+rows=400 cols=1000 toons=10 max-steps=10000 seed=1
+delay-ms=120 render=on
+rr-burst-chance=0.15 jump-chance=0.25 shoot-chance=0.15 shoot-cooldown-ms=1500 freeze-ms=1000
+benchmark=on sweep=off benchmark-trials=1
+note: benchmark/sweep trials force render=off delay-ms=0 internally
+      regardless of the render/delay-ms values printed above
+
+=== Benchmark: toons=10 trials=1 ticks/trial=10000 ===
+Throughput: mean=4411.1 ticks/sec  stddev=0.0 ticks/sec
+Frame latency: mean=226.67 us  stddev=37.02 us  (n=9999 samples)
+Lock wait: mean=89.6% of thread wall-clock time blocked on board.mtx
+
+--- trial 1 (seed=2) ---
+=== Config ===
+rows=400 cols=1000 toons=10 max-steps=10000 seed=2
+delay-ms=120 render=on
+rr-burst-chance=0.15 jump-chance=0.25 shoot-chance=0.15 shoot-cooldown-ms=1500 freeze-ms=1000
+benchmark=on sweep=off benchmark-trials=1
+note: benchmark/sweep trials force render=off delay-ms=0 internally
+      regardless of the render/delay-ms values printed above
+
+=== Benchmark: toons=10 trials=1 ticks/trial=10000 ===
+Throughput: mean=4532.8 ticks/sec  stddev=0.0 ticks/sec
+Frame latency: mean=220.54 us  stddev=32.56 us  (n=10000 samples)
+Lock wait: mean=90.0% of thread wall-clock time blocked on board.mtx
+
+--- trial 2 (seed=3) ---
+=== Config ===
+rows=400 cols=1000 toons=10 max-steps=10000 seed=3
+delay-ms=120 render=on
+rr-burst-chance=0.15 jump-chance=0.25 shoot-chance=0.15 shoot-cooldown-ms=1500 freeze-ms=1000
+benchmark=on sweep=off benchmark-trials=1
+note: benchmark/sweep trials force render=off delay-ms=0 internally
+      regardless of the render/delay-ms values printed above
+
+=== Benchmark: toons=10 trials=1 ticks/trial=10000 ===
+Throughput: mean=4286.3 ticks/sec  stddev=0.0 ticks/sec
+Frame latency: mean=233.28 us  stddev=20.74 us  (n=9999 samples)
+Lock wait: mean=90.0% of thread wall-clock time blocked on board.mtx
+
+--- trial 3 (seed=4) ---
+=== Config ===
+rows=400 cols=1000 toons=10 max-steps=10000 seed=4
+delay-ms=120 render=on
+rr-burst-chance=0.15 jump-chance=0.25 shoot-chance=0.15 shoot-cooldown-ms=1500 freeze-ms=1000
+benchmark=on sweep=off benchmark-trials=1
+note: benchmark/sweep trials force render=off delay-ms=0 internally
+      regardless of the render/delay-ms values printed above
+
+=== Benchmark: toons=10 trials=1 ticks/trial=10000 ===
+Throughput: mean=2895.5 ticks/sec  stddev=0.0 ticks/sec
+Frame latency: mean=345.37 us  stddev=70.56 us  (n=9999 samples)
+Lock wait: mean=90.0% of thread wall-clock time blocked on board.mtx
+
+--- trial 4 (seed=5) ---
+=== Config ===
+rows=400 cols=1000 toons=10 max-steps=10000 seed=5
+delay-ms=120 render=on
+rr-burst-chance=0.15 jump-chance=0.25 shoot-chance=0.15 shoot-cooldown-ms=1500 freeze-ms=1000
+benchmark=on sweep=off benchmark-trials=1
+note: benchmark/sweep trials force render=off delay-ms=0 internally
+      regardless of the render/delay-ms values printed above
+
+=== Benchmark: toons=10 trials=1 ticks/trial=10000 ===
+Throughput: mean=2363.6 ticks/sec  stddev=0.0 ticks/sec
+Frame latency: mean=423.05 us  stddev=28.24 us  (n=9999 samples)
+Lock wait: mean=90.0% of thread wall-clock time blocked on board.mtx
+
+===== N=100 =====
+--- trial 0 (seed=1) ---
+=== Config ===
+rows=400 cols=1000 toons=100 max-steps=10000 seed=1
+delay-ms=120 render=on
+rr-burst-chance=0.15 jump-chance=0.25 shoot-chance=0.15 shoot-cooldown-ms=1500 freeze-ms=1000
+benchmark=on sweep=off benchmark-trials=1
+note: benchmark/sweep trials force render=off delay-ms=0 internally
+      regardless of the render/delay-ms values printed above
+
+=== Benchmark: toons=100 trials=1 ticks/trial=10000 ===
+Throughput: mean=2395.2 ticks/sec  stddev=0.0 ticks/sec
+Frame latency: mean=417.50 us  stddev=34.63 us  (n=9999 samples)
+Lock wait: mean=99.0% of thread wall-clock time blocked on board.mtx
+
+--- trial 1 (seed=2) ---
+=== Config ===
+rows=400 cols=1000 toons=100 max-steps=10000 seed=2
+delay-ms=120 render=on
+rr-burst-chance=0.15 jump-chance=0.25 shoot-chance=0.15 shoot-cooldown-ms=1500 freeze-ms=1000
+benchmark=on sweep=off benchmark-trials=1
+note: benchmark/sweep trials force render=off delay-ms=0 internally
+      regardless of the render/delay-ms values printed above
+
+=== Benchmark: toons=100 trials=1 ticks/trial=10000 ===
+Throughput: mean=2532.8 ticks/sec  stddev=0.0 ticks/sec
+Frame latency: mean=394.82 us  stddev=19.55 us  (n=9999 samples)
+Lock wait: mean=99.0% of thread wall-clock time blocked on board.mtx
+
+--- trial 2 (seed=3) ---
+=== Config ===
+rows=400 cols=1000 toons=100 max-steps=10000 seed=3
+delay-ms=120 render=on
+rr-burst-chance=0.15 jump-chance=0.25 shoot-chance=0.15 shoot-cooldown-ms=1500 freeze-ms=1000
+benchmark=on sweep=off benchmark-trials=1
+note: benchmark/sweep trials force render=off delay-ms=0 internally
+      regardless of the render/delay-ms values printed above
+
+=== Benchmark: toons=100 trials=1 ticks/trial=10000 ===
+Throughput: mean=2557.4 ticks/sec  stddev=0.0 ticks/sec
+Frame latency: mean=391.03 us  stddev=22.38 us  (n=9999 samples)
+Lock wait: mean=99.0% of thread wall-clock time blocked on board.mtx
+
+--- trial 3 (seed=4) ---
+=== Config ===
+rows=400 cols=1000 toons=100 max-steps=10000 seed=4
+delay-ms=120 render=on
+rr-burst-chance=0.15 jump-chance=0.25 shoot-chance=0.15 shoot-cooldown-ms=1500 freeze-ms=1000
+benchmark=on sweep=off benchmark-trials=1
+note: benchmark/sweep trials force render=off delay-ms=0 internally
+      regardless of the render/delay-ms values printed above
+
+=== Benchmark: toons=100 trials=1 ticks/trial=10000 ===
+Throughput: mean=2572.2 ticks/sec  stddev=0.0 ticks/sec
+Frame latency: mean=388.76 us  stddev=38.58 us  (n=9999 samples)
+Lock wait: mean=99.0% of thread wall-clock time blocked on board.mtx
+
+--- trial 4 (seed=5) ---
+=== Config ===
+rows=400 cols=1000 toons=100 max-steps=10000 seed=5
+delay-ms=120 render=on
+rr-burst-chance=0.15 jump-chance=0.25 shoot-chance=0.15 shoot-cooldown-ms=1500 freeze-ms=1000
+benchmark=on sweep=off benchmark-trials=1
+note: benchmark/sweep trials force render=off delay-ms=0 internally
+      regardless of the render/delay-ms values printed above
+
+=== Benchmark: toons=100 trials=1 ticks/trial=10000 ===
+Throughput: mean=2594.6 ticks/sec  stddev=0.0 ticks/sec
+Frame latency: mean=385.39 us  stddev=25.76 us  (n=9999 samples)
+Lock wait: mean=99.0% of thread wall-clock time blocked on board.mtx
+
+===== N=1000 =====
+--- trial 0 (seed=1) ---
+=== Config ===
+rows=400 cols=1000 toons=1000 max-steps=10000 seed=1
+delay-ms=120 render=on
+rr-burst-chance=0.15 jump-chance=0.25 shoot-chance=0.15 shoot-cooldown-ms=1500 freeze-ms=1000
+benchmark=on sweep=off benchmark-trials=1
+note: benchmark/sweep trials force render=off delay-ms=0 internally
+      regardless of the render/delay-ms values printed above
+
+=== Benchmark: toons=1000 trials=1 ticks/trial=10000 ===
+Throughput: mean=2506.2 ticks/sec  stddev=0.0 ticks/sec
+Frame latency: mean=398.97 us  stddev=42.53 us  (n=9999 samples)
+Lock wait: mean=99.9% of thread wall-clock time blocked on board.mtx
+
+--- trial 1 (seed=2) ---
+=== Config ===
+rows=400 cols=1000 toons=1000 max-steps=10000 seed=2
+delay-ms=120 render=on
+rr-burst-chance=0.15 jump-chance=0.25 shoot-chance=0.15 shoot-cooldown-ms=1500 freeze-ms=1000
+benchmark=on sweep=off benchmark-trials=1
+note: benchmark/sweep trials force render=off delay-ms=0 internally
+      regardless of the render/delay-ms values printed above
+
+=== Benchmark: toons=1000 trials=1 ticks/trial=10000 ===
+Throughput: mean=2597.0 ticks/sec  stddev=0.0 ticks/sec
+Frame latency: mean=385.04 us  stddev=38.59 us  (n=9999 samples)
+Lock wait: mean=99.9% of thread wall-clock time blocked on board.mtx
+
+--- trial 2 (seed=3) ---
+=== Config ===
+rows=400 cols=1000 toons=1000 max-steps=10000 seed=3
+delay-ms=120 render=on
+rr-burst-chance=0.15 jump-chance=0.25 shoot-chance=0.15 shoot-cooldown-ms=1500 freeze-ms=1000
+benchmark=on sweep=off benchmark-trials=1
+note: benchmark/sweep trials force render=off delay-ms=0 internally
+      regardless of the render/delay-ms values printed above
+
+=== Benchmark: toons=1000 trials=1 ticks/trial=10000 ===
+Throughput: mean=1894.0 ticks/sec  stddev=0.0 ticks/sec
+Frame latency: mean=527.94 us  stddev=99.03 us  (n=9999 samples)
+Lock wait: mean=99.9% of thread wall-clock time blocked on board.mtx
+
+--- trial 3 (seed=4) ---
+=== Config ===
+rows=400 cols=1000 toons=1000 max-steps=10000 seed=4
+delay-ms=120 render=on
+rr-burst-chance=0.15 jump-chance=0.25 shoot-chance=0.15 shoot-cooldown-ms=1500 freeze-ms=1000
+benchmark=on sweep=off benchmark-trials=1
+note: benchmark/sweep trials force render=off delay-ms=0 internally
+      regardless of the render/delay-ms values printed above
+
+=== Benchmark: toons=1000 trials=1 ticks/trial=10000 ===
+Throughput: mean=2598.9 ticks/sec  stddev=0.0 ticks/sec
+Frame latency: mean=384.80 us  stddev=39.79 us  (n=9999 samples)
+Lock wait: mean=99.9% of thread wall-clock time blocked on board.mtx
+
+--- trial 4 (seed=5) ---
+=== Config ===
+rows=400 cols=1000 toons=1000 max-steps=10000 seed=5
+delay-ms=120 render=on
+rr-burst-chance=0.15 jump-chance=0.25 shoot-chance=0.15 shoot-cooldown-ms=1500 freeze-ms=1000
+benchmark=on sweep=off benchmark-trials=1
+note: benchmark/sweep trials force render=off delay-ms=0 internally
+      regardless of the render/delay-ms values printed above
+
+=== Benchmark: toons=1000 trials=1 ticks/trial=10000 ===
+Throughput: mean=2564.7 ticks/sec  stddev=0.0 ticks/sec
+Frame latency: mean=389.91 us  stddev=49.61 us  (n=9999 samples)
+Lock wait: mean=99.9% of thread wall-clock time blocked on board.mtx
+
+===== N=10000 =====
+--- trial 0 (seed=1) ---
+=== Config ===
+rows=400 cols=1000 toons=10000 max-steps=10000 seed=1
+delay-ms=120 render=on
+rr-burst-chance=0.15 jump-chance=0.25 shoot-chance=0.15 shoot-cooldown-ms=1500 freeze-ms=1000
+benchmark=on sweep=off benchmark-trials=1
+note: benchmark/sweep trials force render=off delay-ms=0 internally
+      regardless of the render/delay-ms values printed above
+
+=== Benchmark: toons=10000 trials=1 ticks/trial=10000 ===
+Throughput: mean=2306.0 ticks/sec  stddev=0.0 ticks/sec
+Frame latency: mean=433.62 us  stddev=94.28 us  (n=9999 samples)
+Lock wait: mean=100.0% of thread wall-clock time blocked on board.mtx
+
+--- trial 1 (seed=2) ---
+=== Config ===
+rows=400 cols=1000 toons=10000 max-steps=10000 seed=2
+delay-ms=120 render=on
+rr-burst-chance=0.15 jump-chance=0.25 shoot-chance=0.15 shoot-cooldown-ms=1500 freeze-ms=1000
+benchmark=on sweep=off benchmark-trials=1
+note: benchmark/sweep trials force render=off delay-ms=0 internally
+      regardless of the render/delay-ms values printed above
+
+=== Benchmark: toons=10000 trials=1 ticks/trial=10000 ===
+Throughput: mean=2324.9 ticks/sec  stddev=0.0 ticks/sec
+Frame latency: mean=430.11 us  stddev=93.77 us  (n=9999 samples)
+Lock wait: mean=100.0% of thread wall-clock time blocked on board.mtx
+
+--- trial 2 (seed=3) ---
+=== Config ===
+rows=400 cols=1000 toons=10000 max-steps=10000 seed=3
+delay-ms=120 render=on
+rr-burst-chance=0.15 jump-chance=0.25 shoot-chance=0.15 shoot-cooldown-ms=1500 freeze-ms=1000
+benchmark=on sweep=off benchmark-trials=1
+note: benchmark/sweep trials force render=off delay-ms=0 internally
+      regardless of the render/delay-ms values printed above
+
+=== Benchmark: toons=10000 trials=1 ticks/trial=10000 ===
+Throughput: mean=2542.4 ticks/sec  stddev=0.0 ticks/sec
+Frame latency: mean=393.34 us  stddev=65.21 us  (n=9999 samples)
+Lock wait: mean=100.0% of thread wall-clock time blocked on board.mtx
+
+--- trial 3 (seed=4) ---
+=== Config ===
+rows=400 cols=1000 toons=10000 max-steps=10000 seed=4
+delay-ms=120 render=on
+rr-burst-chance=0.15 jump-chance=0.25 shoot-chance=0.15 shoot-cooldown-ms=1500 freeze-ms=1000
+benchmark=on sweep=off benchmark-trials=1
+note: benchmark/sweep trials force render=off delay-ms=0 internally
+      regardless of the render/delay-ms values printed above
+
+=== Benchmark: toons=10000 trials=1 ticks/trial=10000 ===
+Throughput: mean=2484.6 ticks/sec  stddev=0.0 ticks/sec
+Frame latency: mean=402.49 us  stddev=58.90 us  (n=9999 samples)
+Lock wait: mean=100.0% of thread wall-clock time blocked on board.mtx
+
+--- trial 4 (seed=5) ---
+=== Config ===
+rows=400 cols=1000 toons=10000 max-steps=10000 seed=5
+delay-ms=120 render=on
+rr-burst-chance=0.15 jump-chance=0.25 shoot-chance=0.15 shoot-cooldown-ms=1500 freeze-ms=1000
+benchmark=on sweep=off benchmark-trials=1
+note: benchmark/sweep trials force render=off delay-ms=0 internally
+      regardless of the render/delay-ms values printed above
+
+--- trial 4 (seed=5) rerun ---
+=== Config ===
+rows=400 cols=1000 toons=10000 max-steps=10000 seed=5
+delay-ms=120 render=on
+rr-burst-chance=0.15 jump-chance=0.25 shoot-chance=0.15 shoot-cooldown-ms=1500 freeze-ms=1000
+benchmark=on sweep=off benchmark-trials=1
+note: benchmark/sweep trials force render=off delay-ms=0 internally
+      regardless of the render/delay-ms values printed above
+
+=== Benchmark: toons=10000 trials=1 ticks/trial=10000 ===
+Throughput: mean=3830.4 ticks/sec  stddev=0.0 ticks/sec
+Frame latency: mean=261.08 us  stddev=16.67 us  (n=9999 samples)
+Lock wait: mean=100.0% of thread wall-clock time blocked on board.mtx
+
