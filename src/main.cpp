@@ -5,6 +5,7 @@
 #include <cmath>
 #include <csignal>
 #include <functional>
+#include <deque>
 #include <iomanip>
 #include <iostream>
 #include <mutex>
@@ -13,6 +14,8 @@
 #include <thread>
 #include <vector>
 #include <fstream>
+
+#include "web_ui.hpp"
 
 using namespace std;
 using namespace std::chrono;
@@ -28,8 +31,14 @@ struct Options {
 
     // Output pacing & stacked style
     bool stacked = true;      // print NEW board for each update (matches your sample)
-    bool render = true;       // set false (--no-render) to skip board/event I/O for stress runs
-    int delay_ms = 120;       // wait between printed boards (enhances realism)
+    bool render = true;       // ASCII renderer; disabled automatically by --ui
+    int delay_ms = 120;       // per-agent pacing for interactive runs
+
+    // Local browser dashboard (Linux, localhost only). The UI is deliberately
+    // disabled for --benchmark/--sweep so performance runs remain headless.
+    bool ui = false;
+    int ui_port = 8080;
+    int ui_max_agents = 5000; // cap JSON/render payload for very large runs
 
     // Ability tuning
     double rr_burst_chance = 0.15;     // RoadRunner burst (extra step)
@@ -123,6 +132,11 @@ struct Board {
     mutex render_mtx;                    // serialize printing
 
     vector<Pos> toonPos;                 // per-toon position
+    // Spatial occupancy index: one slot per board cell, storing toon id or -1.
+    // Guarded by mtx and kept in sync with toonPos. Because agents occupy
+    // discrete cells and the movement rules prevent multiple occupancy, this
+    // is a uniform-grid spatial partition with cell size 1x1.
+    vector<int> occupant;
     vector<time_point<steady_clock>> frozen_until;   // guarded by mtx
     vector<time_point<steady_clock>> next_shot_ok;   // guarded by mtx: per-toon shoot cooldown
     vector<int> steps;                   // per-toon step count
@@ -131,8 +145,9 @@ struct Board {
 
     Board(int r, int c, int nToons)
       : R(r), C(c), grid(r, string(c, '.')), cell(r, vector<char>(c, '.')),
-        finishCol(c-1), toonPos(nToons), frozen_until(nToons),
-        next_shot_ok(nToons), steps(nToons,0) {
+        finishCol(c-1), toonPos(nToons),
+        occupant(static_cast<size_t>(r) * static_cast<size_t>(c), -1),
+        frozen_until(nToons), next_shot_ok(nToons), steps(nToons,0) {
         flag = {R/2, C-2};
         for (int t=0;t<nToons;t++){
             frozen_until[t] = steady_clock::time_point::min();
@@ -141,6 +156,41 @@ struct Board {
     }
     bool inBounds(int r, int c) const { return (r>=0 && r<R && c>=0 && c<C); }
 };
+
+// Spatial occupancy helpers.
+// PRECONDITION: caller must already hold board.mtx (i.e. call these only
+// from inside a BoardLock scope). They intentionally do not lock internally,
+// so movement keeps one atomic application-level critical section from
+// occupancy check through position/index update.
+static inline size_t occupancy_index(const Board &board, int r, int c){
+    return static_cast<size_t>(r) * static_cast<size_t>(board.C)
+         + static_cast<size_t>(c);
+}
+
+// O(1) exact-cell occupancy lookup for the simulation's discrete grid.
+// `self` is ignored so a stay-in-place move remains valid.
+static inline bool occ_locked(const Board &board, int r, int c, int self){
+    int who = board.occupant[occupancy_index(board, r, c)];
+    return who != -1 && who != self;
+}
+
+// Keeps toonPos and the spatial occupancy index consistent as one locked
+// state transition. Destination validity/terrain/occupancy must be checked
+// by the caller before invoking this helper.
+static inline void move_toon_locked(Board &board, int self, Pos dest){
+    Pos old = board.toonPos[self];
+    size_t oldIdx = occupancy_index(board, old.r, old.c);
+    size_t newIdx = occupancy_index(board, dest.r, dest.c);
+
+    assert(board.occupant[oldIdx] == self &&
+           "spatial occupancy index disagrees with toonPos at source");
+    assert((board.occupant[newIdx] == -1 || board.occupant[newIdx] == self) &&
+           "destination unexpectedly occupied");
+
+    board.occupant[oldIdx] = -1;
+    board.occupant[newIdx] = self;
+    board.toonPos[self] = dest;
+}
 
 // Ability role — cycles every 3 toons so large --toons counts still exercise
 // all three ability code paths (shoot/freeze, jump, burst) under stress.
@@ -191,6 +241,9 @@ Options parseArgs(int argc, char** argv){
         else if(a=="--freeze-ms") next(o.sam_freeze_ms);
         else if(a=="--jump-chance") { if(i+1<argc) o.coy_jump_chance = stod(argv[++i]); }
         else if(a=="--no-render") o.render = false;
+        else if(a=="--ui") o.ui = true;
+        else if(a=="--ui-port") next(o.ui_port);
+        else if(a=="--ui-max-agents") next(o.ui_max_agents);
         else if(a=="--benchmark") o.benchmark = true;
         else if(a=="--benchmark-trials") next(o.benchmark_trials);
         else if(a=="--sweep") o.sweep = true;
@@ -209,7 +262,10 @@ Options parseArgs(int argc, char** argv){
                  << "  --shoot-cooldown N   (ms, default 1500)\n"
                  << "  --freeze-ms N        (default 1000)\n"
                  << "  --jump-chance X      (default 0.25)\n"
-                 << "  --no-render          (skip per-frame board/event printing; for stress runs)\n"
+                 << "  --no-render          (skip ASCII board/event printing)\n"
+                 << "  --ui                 (run localhost browser dashboard; disables ASCII rendering)\n"
+                 << "  --ui-port N          (dashboard port, default 8080)\n"
+                 << "  --ui-max-agents N    (max agents serialized per UI frame, default 5000)\n"
                  << "  --benchmark          (run --benchmark-trials trials at --toons, headless,\n"
                  << "                        forces delay-ms=0; reports throughput + frame latency)\n"
                  << "  --benchmark-trials N (default 10)\n"
@@ -224,6 +280,10 @@ Options parseArgs(int argc, char** argv){
     o.cols = max(20, o.cols);
     o.maxSteps = max(100, o.maxSteps);
     o.benchmark_trials = max(1, o.benchmark_trials);
+    o.ui_port = min(65535, max(1024, o.ui_port));
+    o.ui_max_agents = max(1, o.ui_max_agents);
+    if(o.benchmark || o.sweep) o.ui = false;
+    if(o.ui) o.render = false; // browser UI replaces the stacked ASCII renderer
     return o;
 }
 
@@ -231,12 +291,16 @@ static void printConfig(const Options &o){
     cout << "=== Config ===\n"
          << "rows=" << o.rows << " cols=" << o.cols << " toons=" << o.toons
          << " max-steps=" << o.maxSteps << " seed=" << o.seed << "\n"
-         << "delay-ms=" << o.delay_ms << " render=" << (o.render ? "on" : "off") << "\n"
+         << "delay-ms=" << o.delay_ms << " render=" << (o.render ? "on" : "off")
+         << " ui=" << (o.ui ? "on" : "off") << "\n"
          << "rr-burst-chance=" << o.rr_burst_chance
          << " jump-chance=" << o.coy_jump_chance
          << " shoot-chance=" << o.sam_shoot_chance
          << " shoot-cooldown-ms=" << o.sam_cooldown_ms
          << " freeze-ms=" << o.sam_freeze_ms << "\n";
+    if(o.ui){
+        cout << "ui-port=" << o.ui_port << " ui-max-agents=" << o.ui_max_agents << "\n";
+    }
     if(o.benchmark || o.sweep){
         cout << "benchmark=" << (o.benchmark?"on":"off") << " sweep=" << (o.sweep?"on":"off")
              << " benchmark-trials=" << o.benchmark_trials;
@@ -297,6 +361,30 @@ static Welford combine(const Welford &a, const Welford &b){
     return c;
 }
 
+struct UiRuntime {
+    atomic<bool> paused{false};
+    atomic<bool> exitRequested{false};
+    atomic<int> delayMs{120};
+    mutex commandMtx;
+    deque<UiCommand> commands;
+
+    void enqueue(const UiCommand &cmd){
+        lock_guard<mutex> lk(commandMtx);
+        commands.push_back(cmd);
+    }
+
+    vector<UiCommand> drain(){
+        lock_guard<mutex> lk(commandMtx);
+        vector<UiCommand> out;
+        out.reserve(commands.size());
+        while(!commands.empty()){
+            out.push_back(commands.front());
+            commands.pop_front();
+        }
+        return out;
+    }
+};
+
 struct TrialResult {
     long long ticks = 0;
     double elapsedSec = 0.0;
@@ -328,6 +416,11 @@ static TrialResult runOneGame(Options opt){
     atomic<bool> gameOver(false);
     atomic<int> winner(-1);
     atomic<int> totalSteps(0);
+
+    UiRuntime uiRuntime;
+    uiRuntime.delayMs.store(opt.delay_ms);
+    const bool uiEnabled = opt.ui;
+    const auto uiStartTime = steady_clock::now();
 
     mt19937 rng(opt.seed);
     uniform_int_distribution<int> rr(0, board.R-1), cc(0, board.C-3);
@@ -363,12 +456,88 @@ static TrialResult runOneGame(Options opt){
                      << " toons; increase --rows/--cols.\n";
                 exit(1);
             }
-            used[r][c]=true; board.toonPos[t] = {r,c};
+            used[r][c]=true;
+            board.toonPos[t] = {r,c};
+            board.occupant[occupancy_index(board, r, c)] = t;
         }
     }
 
     rebuild_grid(board);
     if(opt.render) print_board(board, totalSteps.load());
+
+    unique_ptr<WebUiServer> uiServer;
+    if(uiEnabled){
+        auto layoutProvider = [&]() -> UiLayout {
+            UiLayout l;
+            BoardLock lk(board.mtx);
+            l.rows = board.R;
+            l.cols = board.C;
+            l.flagR = board.flag.r;
+            l.flagC = board.flag.c;
+            for(int r=0; r<board.R; ++r)
+                for(int c=0; c<board.C; ++c)
+                    if(board.cell[r][c] == '#') l.walls.push_back({r,c});
+            return l;
+        };
+
+        auto stateProvider = [&](int selectedAgent) -> UiState {
+            UiState out;
+            const auto tnow = steady_clock::now();
+            out.rows = board.R;
+            out.cols = board.C;
+            out.totalAgents = opt.toons;
+            out.totalSteps = totalSteps.load();
+            out.delayMs = uiRuntime.delayMs.load();
+            out.paused = uiRuntime.paused.load();
+            out.gameOver = gameOver.load();
+            out.winner = winner.load();
+            out.elapsedSec = duration<double>(tnow - uiStartTime).count();
+
+            BoardLock lk(board.mtx);
+            const int limit = min(opt.toons, opt.ui_max_agents);
+            out.agents.reserve(limit);
+            for(int t=0; t<opt.toons; ++t){
+                const bool frozen = tnow < board.frozen_until[t];
+                if(frozen) ++out.frozenAgents;
+                auto makeView = [&](int id) {
+                    UiAgentView a;
+                    a.id = id;
+                    a.role = id % 3;
+                    a.name = board.toonNm[id];
+                    a.r = board.toonPos[id].r;
+                    a.c = board.toonPos[id].c;
+                    a.steps = board.steps[id];
+                    a.frozen = tnow < board.frozen_until[id];
+                    if(a.frozen)
+                        a.freezeRemainingMs = max<long long>(0, duration_cast<milliseconds>(board.frozen_until[id] - tnow).count());
+                    if(a.role == YOSEMITESAM){
+                        a.canShoot = tnow >= board.next_shot_ok[id];
+                        if(!a.canShoot)
+                            a.cooldownRemainingMs = max<long long>(0, duration_cast<milliseconds>(board.next_shot_ok[id] - tnow).count());
+                    }
+                    return a;
+                };
+                if(t < limit) out.agents.push_back(makeView(t));
+                if(t == selectedAgent){
+                    out.hasSelected = true;
+                    out.selected = makeView(t);
+                }
+            }
+            out.displayedAgents = static_cast<int>(out.agents.size());
+            return out;
+        };
+
+        auto commandSink = [&](const UiCommand &cmd){ uiRuntime.enqueue(cmd); };
+        uiServer = make_unique<WebUiServer>(opt.ui_port, layoutProvider, stateProvider, commandSink);
+        if(uiServer->start()){
+            cout << "UI dashboard: http://127.0.0.1:" << opt.ui_port << "\n"
+                 << "  Browser snapshots are read-only; controls are queued into the simulation loop.\n\n";
+            cout.flush();
+        } else {
+            cerr << "Warning: UI server failed to start; simulation will continue headless.\n";
+            uiServer.reset();
+        }
+    }
 
     auto now = []{ return steady_clock::now(); };
 
@@ -434,6 +603,11 @@ static TrialResult runOneGame(Options opt){
         else if(role==YOSEMITESAM) base_sleep = milliseconds(75);
 
         while(!gameOver.load() && !gStop.load()){
+            if(uiEnabled && uiRuntime.paused.load()){
+                this_thread::sleep_for(milliseconds(10));
+                continue;
+            }
+
             // If frozen, just wait. Read frozen_until under the same mutex
             // that protects its writes (fixes a TSan-detected data race:
             // this used to be an unlocked read racing the locked write
@@ -464,14 +638,13 @@ static TrialResult runOneGame(Options opt){
                 BoardLock lk(board.mtx);
                 Pos cur = board.toonPos[t];
                 Pos nxt{cur.r + step.r, cur.c + step.c};
-                auto occ = [&](int r,int c){ for(size_t k=0;k<board.toonPos.size();k++) if((int)k!=t){ if(board.toonPos[k].r==r && board.toonPos[k].c==c) return true;} return false; };
-
                 auto try_move = [&](Pos dest){
-                    if(board.inBounds(dest.r,dest.c) && dest.c < board.finishCol && board.cell[dest.r][dest.c] != '#' && !occ(dest.r,dest.c)){
-                        board.toonPos[t] = dest; board.steps[t]++; moved=true; return true; }
+                    if(board.inBounds(dest.r,dest.c) && dest.c < board.finishCol && board.cell[dest.r][dest.c] != '#' && !occ_locked(board, dest.r, dest.c, t)){
+                        move_toon_locked(board, t, dest);
+                        board.steps[t]++; moved=true; return true; }
                     return false; };
 
-                bool blocked = !(board.inBounds(nxt.r,nxt.c) && nxt.c < board.finishCol) || board.cell[nxt.r][nxt.c]=='#' || occ(nxt.r,nxt.c);
+                bool blocked = !(board.inBounds(nxt.r,nxt.c) && nxt.c < board.finishCol) || board.cell[nxt.r][nxt.c]=='#' || occ_locked(board, nxt.r, nxt.c, t);
 
                 // Coyote-role: jump over one cell sometimes when blocked
                 if(blocked && role==COYOTE && chance(trng) < opt.coy_jump_chance){
@@ -557,9 +730,9 @@ static TrialResult runOneGame(Options opt){
                     Pos step2 = (abs(dir.r)+abs(dir.c) ? Pos{ (dir.r!=0)?dir.r:0, (dir.r==0)?dir.c:0 } : pick_step(trng));
                     Pos nxt{cur.r + step2.r, cur.c + step2.c};
 
-                    auto occ = [&](int r,int c){ for(size_t k=0;k<board.toonPos.size();k++) if((int)k!=t){ if(board.toonPos[k].r==r && board.toonPos[k].c==c) return true;} return false; };
-                    if(board.inBounds(nxt.r,nxt.c) && nxt.c < board.finishCol && board.cell[nxt.r][nxt.c] != '#' && !occ(nxt.r,nxt.c)){
-                        board.toonPos[t] = nxt; board.steps[t]++;
+                    if(board.inBounds(nxt.r,nxt.c) && nxt.c < board.finishCol && board.cell[nxt.r][nxt.c] != '#' && !occ_locked(board, nxt.r, nxt.c, t)){
+                        move_toon_locked(board, t, nxt);
+                        board.steps[t]++;
                         rebuild_grid(board); int ts = ++totalSteps;
                         recordTick();
                         if(opt.render) print_board(board, ts);
@@ -567,8 +740,10 @@ static TrialResult runOneGame(Options opt){
                 }
             }
 
-            // Global pacing so stacked frames feel smooth
-            if(opt.delay_ms > 0) this_thread::sleep_for(milliseconds(opt.delay_ms));
+            // Interactive pacing. UI mode can change this live without touching
+            // benchmark/sweep behavior (those paths force ui=false and delay=0).
+            int liveDelayMs = uiEnabled ? uiRuntime.delayMs.load() : opt.delay_ms;
+            if(liveDelayMs > 0) this_thread::sleep_for(milliseconds(liveDelayMs));
         }
 
 #ifdef LOCK_INSTRUMENTATION
@@ -606,9 +781,55 @@ static TrialResult runOneGame(Options opt){
         measuring.store(false);
         gameOver.store(true);
     } else {
-        // Stop on: a winner, Ctrl+C, or hitting the step cap (max-steps was
-        // previously parsed but never enforced anywhere — a no-op flag).
+        // Stop on: a winner, Ctrl+C, or hitting the step cap. In UI mode this
+        // same main/control thread also applies queued browser commands, so the
+        // HTTP server never mutates Board directly.
         while(!gameOver.load() && !gStop.load() && totalSteps.load() < opt.maxSteps){
+            if(uiEnabled){
+                for(const UiCommand &cmd : uiRuntime.drain()){
+                    switch(cmd.type){
+                        case UiCommandType::Pause:
+                            uiRuntime.paused.store(true);
+                            break;
+                        case UiCommandType::Resume:
+                            uiRuntime.paused.store(false);
+                            break;
+                        case UiCommandType::Stop:
+                            uiRuntime.exitRequested.store(true);
+                            gameOver.store(true);
+                            break;
+                        case UiCommandType::SetDelayMs:
+                            uiRuntime.delayMs.store(max(0, min(300, cmd.value)));
+                            break;
+                        case UiCommandType::FreezeAgent:
+                            if(cmd.agentId >= 0 && cmd.agentId < opt.toons){
+                                BoardLock lk(board.mtx);
+                                board.frozen_until[cmd.agentId] = now() + milliseconds(max(0, cmd.value));
+                            }
+                            break;
+                        case UiCommandType::UnfreezeAgent:
+                            if(cmd.agentId >= 0 && cmd.agentId < opt.toons){
+                                BoardLock lk(board.mtx);
+                                board.frozen_until[cmd.agentId] = steady_clock::time_point::min();
+                            }
+                            break;
+                        case UiCommandType::AddWall:
+                            if(board.inBounds(cmd.r, cmd.c) && cmd.c < board.finishCol){
+                                BoardLock lk(board.mtx);
+                                size_t idx = occupancy_index(board, cmd.r, cmd.c);
+                                if(board.occupant[idx] == -1 && !(cmd.r == board.flag.r && cmd.c == board.flag.c))
+                                    board.cell[cmd.r][cmd.c] = '#';
+                            }
+                            break;
+                        case UiCommandType::RemoveWall:
+                            if(board.inBounds(cmd.r, cmd.c)){
+                                BoardLock lk(board.mtx);
+                                if(board.cell[cmd.r][cmd.c] == '#') board.cell[cmd.r][cmd.c] = '.';
+                            }
+                            break;
+                    }
+                }
+            }
             this_thread::sleep_for(milliseconds(5));
         }
         gameOver.store(true); // release any workers still waiting on gameOver (step-limit / Ctrl+C cases)
@@ -661,7 +882,24 @@ static TrialResult runOneGame(Options opt){
         } else {
             cout << "No winner — interrupted.\n";
         }
+
+        // Preserve the final board/agent snapshot after a natural UI-mode
+        // completion so the browser does not disappear the moment a winner
+        // is declared. The Stop button (or Ctrl+C) closes the dashboard.
+        if(uiServer && !uiRuntime.exitRequested.load() && !gStop.load()){
+            cout << "Simulation complete. Dashboard remains available at http://127.0.0.1:"
+                 << opt.ui_port << " — press Stop in the UI or Ctrl+C to exit.\n";
+            cout.flush();
+            while(!uiRuntime.exitRequested.load() && !gStop.load()){
+                for(const UiCommand &cmd : uiRuntime.drain()){
+                    if(cmd.type == UiCommandType::Stop)
+                        uiRuntime.exitRequested.store(true);
+                }
+                this_thread::sleep_for(milliseconds(25));
+            }
+        }
     }
+    if(uiServer) uiServer->stop();
     return res;
 }
 

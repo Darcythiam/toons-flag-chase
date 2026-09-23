@@ -17,7 +17,7 @@ set_property(CACHE SANITIZER PROPERTY STRINGS none thread address)
 #   cmake -S . -B build-instrumented -DLOCK_INSTRUMENTATION=ON -DCMAKE_BUILD_TYPE=Release
 option(LOCK_INSTRUMENTATION "Instrument board.mtx wait/hold time (skews throughput; separate build only)" OFF)
 
-add_executable(toons src/main.cpp)
+add_executable(toons src/main.cpp src/web_ui.cpp)
 
 if(LOCK_INSTRUMENTATION)
   target_compile_definitions(toons PRIVATE LOCK_INSTRUMENTATION)
